@@ -1,0 +1,92 @@
+"""OMOP concept ids used by the MIMIC-IV hosp conversion.
+
+Gender, race, ethnicity, visit, and type concepts are standard OMOP
+vocabulary ids. Diagnosis and procedure codes stay in source columns.
+Their standard concept id is 0 until an Athena vocabulary map is applied.
+"""
+
+from __future__ import annotations
+
+# Gender
+MALE = 8507
+FEMALE = 8532
+
+# Race
+WHITE = 8527
+BLACK = 8516
+ASIAN = 8515
+AMERICAN_INDIAN = 8657
+PACIFIC_ISLANDER = 8557
+OTHER_RACE = 8522
+
+# Ethnicity
+HISPANIC = 38003563
+NOT_HISPANIC = 38003564
+
+# Visit and provenance
+INPATIENT_VISIT = 9201
+EHR = 32817
+
+NO_MATCHING_CONCEPT = 0
+
+# First id reserved for dataset-local source concepts.
+LOCAL_CONCEPT_START = 2_000_000_001
+
+GENDER_CONCEPT = {
+    "M": MALE,
+    "F": FEMALE,
+}
+
+# MIMIC-IV stores race and ethnicity in admissions.race.
+# Tuple is (race_concept_id, ethnicity_concept_id).
+RACE_ETHNICITY = {
+    "WHITE": (WHITE, NOT_HISPANIC),
+    "WHITE - BRAZILIAN": (WHITE, NOT_HISPANIC),
+    "WHITE - EASTERN EUROPEAN": (WHITE, NOT_HISPANIC),
+    "WHITE - OTHER EUROPEAN": (WHITE, NOT_HISPANIC),
+    "WHITE - RUSSIAN": (WHITE, NOT_HISPANIC),
+    "BLACK/AFRICAN": (BLACK, NOT_HISPANIC),
+    "BLACK/AFRICAN AMERICAN": (BLACK, NOT_HISPANIC),
+    "BLACK/CAPE VERDEAN": (BLACK, NOT_HISPANIC),
+    "BLACK/CARIBBEAN ISLAND": (BLACK, NOT_HISPANIC),
+    "ASIAN": (ASIAN, NOT_HISPANIC),
+    "ASIAN - ASIAN INDIAN": (ASIAN, NOT_HISPANIC),
+    "ASIAN - CHINESE": (ASIAN, NOT_HISPANIC),
+    "ASIAN - KOREAN": (ASIAN, NOT_HISPANIC),
+    "ASIAN - SOUTH EAST ASIAN": (ASIAN, NOT_HISPANIC),
+    "AMERICAN INDIAN/ALASKA NATIVE": (AMERICAN_INDIAN, NOT_HISPANIC),
+    "NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER": (PACIFIC_ISLANDER, NOT_HISPANIC),
+    "HISPANIC OR LATINO": (NO_MATCHING_CONCEPT, HISPANIC),
+    "HISPANIC/LATINO - CENTRAL AMERICAN": (NO_MATCHING_CONCEPT, HISPANIC),
+    "HISPANIC/LATINO - COLUMBIAN": (NO_MATCHING_CONCEPT, HISPANIC),
+    "HISPANIC/LATINO - CUBAN": (NO_MATCHING_CONCEPT, HISPANIC),
+    "HISPANIC/LATINO - DOMINICAN": (NO_MATCHING_CONCEPT, HISPANIC),
+    "HISPANIC/LATINO - GUATEMALAN": (NO_MATCHING_CONCEPT, HISPANIC),
+    "HISPANIC/LATINO - HONDURAN": (NO_MATCHING_CONCEPT, HISPANIC),
+    "HISPANIC/LATINO - MEXICAN": (NO_MATCHING_CONCEPT, HISPANIC),
+    "HISPANIC/LATINO - PUERTO RICAN": (NO_MATCHING_CONCEPT, HISPANIC),
+    "HISPANIC/LATINO - SALVADORAN": (NO_MATCHING_CONCEPT, HISPANIC),
+    "OTHER": (OTHER_RACE, NO_MATCHING_CONCEPT),
+    "PORTUGUESE": (OTHER_RACE, NO_MATCHING_CONCEPT),
+    "SOUTH AMERICAN": (OTHER_RACE, NO_MATCHING_CONCEPT),
+    "MULTIPLE RACE/ETHNICITY": (NO_MATCHING_CONCEPT, NO_MATCHING_CONCEPT),
+    "UNKNOWN": (NO_MATCHING_CONCEPT, NO_MATCHING_CONCEPT),
+    "UNABLE TO OBTAIN": (NO_MATCHING_CONCEPT, NO_MATCHING_CONCEPT),
+    "PATIENT DECLINED TO ANSWER": (NO_MATCHING_CONCEPT, NO_MATCHING_CONCEPT),
+}
+
+
+def diagnosis_vocabulary(icd_version: int) -> str:
+    if icd_version == 9:
+        return "ICD9CM"
+    if icd_version == 10:
+        return "ICD10CM"
+    return f"ICD{icd_version}"
+
+
+def procedure_vocabulary(icd_version: int) -> str:
+    if icd_version == 9:
+        return "ICD9Proc"
+    if icd_version == 10:
+        return "ICD10PCS"
+    return f"ICD{icd_version}Proc"
