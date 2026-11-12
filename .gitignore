@@ -159,3 +159,10 @@ test-resources/meds_demo/
 # Generated Synthea outputs and dataset caches
 .artifacts/
 examples/.artifacts/
+
+# OMOP vocabularies from Athena: licensed, must never be committed
+athena/
+CONCEPT*.csv
+cpt4.jar
+# MIMIC-IV downloads (credentialed data): keep them outside the repo
+mimiciv/

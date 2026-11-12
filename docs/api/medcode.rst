@@ -227,3 +227,65 @@ Pair                              Notes
     :members:
     :undoc-members:
     :show-inheritance:
+
+OMOP Vocabularies (Athena)
+--------------------------
+
+``OMOPVocabulary`` reads a local download of the OMOP standardized vocabularies
+from `Athena <https://athena.ohdsi.org>`_. Athena vocabularies are licensed and
+cannot be redistributed, so PyHealth does not download them: create an Athena
+account, download a bundle that includes SNOMED, ICD9CM and ICD10CM, unzip it
+outside your repository, and pass that folder to ``OMOPVocabulary``.
+
+It builds two objects:
+
+- ``ConditionHierarchy``: the SNOMED condition graph rooted at "Disease"
+  (concept 4274025) and cut off at a chosen depth, as in KEEP
+  (`Elhussein et al., CHIL 2025 <https://arxiv.org/abs/2510.05049>`_). By
+  default a concept is kept when its shortest path to "Disease" is at most
+  five levels; every "Is a" link between kept concepts is an edge, so concepts
+  with several parents keep all of them.
+- ``ICDToSNOMEDMapper``: maps ICD-9-CM and ICD-10-CM diagnosis codes, written
+  with or without dots (MIMIC omits them), to standard concepts through
+  Athena's "Maps to" links.
+
+.. code-block:: python
+
+   import polars as pl
+   from pyhealth.medcode import ConditionHierarchy, ICDToSNOMEDMapper, OMOPVocabulary
+
+   vocab = OMOPVocabulary("~/data/athena")
+
+   # Build once from the multi-GB Athena files, then save for later runs
+   hierarchy = vocab.condition_hierarchy(max_depth=5)
+   hierarchy.save("~/.cache/pyhealth/omop/hierarchy_d5")
+   hierarchy = ConditionHierarchy.load("~/.cache/pyhealth/omop/hierarchy_d5")
+
+   # Shallower graphs for a depth ablation, without re-reading Athena
+   depth_3 = hierarchy.restrict(3)
+
+   mapper = vocab.icd_mapper()
+   concept_ids = mapper.map("I214", version=10)
+
+   # Kept ancestors of any concept under "Disease", nearest first
+   hierarchy.retained_ancestors(concept_ids[0])
+
+   # Map a whole diagnoses table, e.g. MIMIC-IV hosp/diagnoses_icd
+   diagnoses = pl.read_csv("~/data/mimiciv/3.1/hosp/diagnoses_icd.csv.gz",
+                           schema_overrides={"icd_code": pl.Utf8})
+   mapped = mapper.map_frame(diagnoses)
+
+   # Triples for pyhealth.graph.KnowledgeGraph
+   triples = hierarchy.to_triples()
+
+.. autoclass:: pyhealth.medcode.OMOPVocabulary
+    :members:
+    :show-inheritance:
+
+.. autoclass:: pyhealth.medcode.ConditionHierarchy
+    :members:
+    :show-inheritance:
+
+.. autoclass:: pyhealth.medcode.ICDToSNOMEDMapper
+    :members:
+    :show-inheritance:
