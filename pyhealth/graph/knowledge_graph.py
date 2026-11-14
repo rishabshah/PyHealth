@@ -37,6 +37,8 @@ class KnowledgeGraph:
     Args:
         triples: List of (head, relation, tail) string tuples,
             OR path to a CSV/TSV file with head/relation/tail columns.
+            An empty list is supported with explicit entity and relation
+            mappings, for graphs that only contain isolated entities.
         entity2id: Optional pre-built entity-to-ID mapping.
             If None, built automatically from triples.
         relation2id: Optional pre-built relation-to-ID mapping.
@@ -88,8 +90,11 @@ class KnowledgeGraph:
         if isinstance(triples, (str, Path)):
             triples = self._load_triples_from_file(triples)
 
-        if len(triples) == 0:
-            raise ValueError("triples must be a non-empty list.")
+        if len(triples) == 0 and (not entity2id or relation2id is None):
+            raise ValueError(
+                "triples must be a non-empty list unless explicit entity "
+                "and relation mappings are provided."
+            )
 
         # Validate triple format
         for i, t in enumerate(triples):

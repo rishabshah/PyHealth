@@ -81,6 +81,7 @@ pixels through the processor's ``collate`` method.
 - ``MultiHotProcessor``: For multi-hot encoding
 - ``IgnoreProcessor``: A special feature processor that marks a feature to be ignored.
 - ``GraphProcessor``: For knowledge graph subgraph extraction (e.g., GraphCare, G-BERT)
+- ``AncestorRollupProcessor``: For depth-limited ancestor roll-up over a condition hierarchy (e.g., KEEP), with an OMOP vocabulary factory
 
 **Temporal Multimodal Processors (** :class:`~pyhealth.processors.TemporalFeatureProcessor` **subclasses):**
 
@@ -610,4 +611,5 @@ API Reference
     processors/pyhealth.processors.StageNetProcessor
     processors/pyhealth.processors.StageNetTensorProcessor
     processors/pyhealth.processors.GraphProcessor
+    processors/pyhealth.processors.AncestorRollupProcessor
     processors/pyhealth.processors.utils

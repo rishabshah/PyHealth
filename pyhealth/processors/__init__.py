@@ -72,6 +72,11 @@ from .timeseries_label_processor import (
 )
 from .time_image_processor import TimeImageProcessor
 from .graph_processor import GraphProcessor
+from .ancestor_rollup_processor import (
+    AncestorRollupProcessor,
+    RollupResult,
+    UnmappedCodeError,
+)
 from .audio_processor import AudioProcessor
 from .ignore_processor import IgnoreProcessor
 from .temporal_timeseries_processor import TemporalTimeseriesProcessor
@@ -123,6 +128,9 @@ __all__ = [
     "TimeseriesRegressionLabelProcessor",
     "TimeImageProcessor",
     "GraphProcessor",
+    "AncestorRollupProcessor",
+    "RollupResult",
+    "UnmappedCodeError",
     "AudioProcessor",
     "TupleTimeTextProcessor",
     "CehrProcessor",
