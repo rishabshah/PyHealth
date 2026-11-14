@@ -52,6 +52,7 @@ tables:
     attributes:
       - "visit_occurrence_id"
       - "condition_concept_id"
+      - "condition_source_value"
       - "condition_start_date"
       - "condition_start_datetime"
       - "condition_end_date"
