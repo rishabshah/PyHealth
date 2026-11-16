@@ -16,16 +16,21 @@ class MIMICOMOPDataset(OMOPDataset):
     """OMOP CDM tables produced from MIMIC-IV, as PyHealth patients.
 
     Person, visit, and death tables load through :class:`OMOPDataset`.
-    Condition rows are included so a cohort can be filtered by diagnosis.
-    ``get_condition_code`` returns the standard concept id when one is
-    mapped, and the source code otherwise. MIMIC-IV conversions often leave
-    ``condition_concept_id`` at 0 until an Athena vocabulary is applied, and
-    the ICD code then lives in ``condition_source_value``.
+    ``condition_occurrence`` is added on top of those defaults so
+    :class:`~pyhealth.patient_builder.PatientBuilder` can filter the cohort.
+    Each condition event keeps its diagnosis id, concept id, source value,
+    source concept id, status, dates, and visit id. ``get_condition_code`` returns the
+    standard concept id when one is mapped, and the source code when
+    ``condition_concept_id`` is 0.
+
+    The CSV directory is produced separately; see ``patient_builder/convert.py``
+    on the ``patient_builder`` branch.
 
     Examples:
         >>> from pyhealth.datasets import MIMICOMOPDataset
         >>> dataset = MIMICOMOPDataset(root="/path/to/mimic_iv_omop")  # doctest: +SKIP
         >>> patient = dataset.get_patient(dataset.unique_patient_ids[0])  # doctest: +SKIP
+        >>> patient.get_events(event_type="condition_occurrence")  # doctest: +SKIP
         >>> dataset.get_visit_count(patient)  # doctest: +SKIP
         2
     """

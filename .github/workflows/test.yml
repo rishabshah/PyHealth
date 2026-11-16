@@ -45,6 +45,10 @@ jobs:
       - name: Run core tests
         run: 'pixi run -e test pytest tests/core -v --cov=pyhealth --cov-report='
 
+      - name: Run patient builder tests
+        if: ${{ !cancelled() }}
+        run: 'pixi run -e test pytest tests/patient_builder -v --cov=pyhealth --cov-append --cov-report='
+
       - name: Run NLP tests
         if: ${{ !cancelled() }}
         run: 'pixi run -e nlp pytest tests/nlp -v --cov=pyhealth --cov-append --cov-report='

@@ -1,4 +1,8 @@
-from pyhealth.patient_builder import PatientBuilder
+from pyhealth.patient_builder import (
+    ConditionRecord,
+    PatientBuilder,
+    concepts_with_repeated_diagnoses,
+)
 
 
 class MockCondition:
@@ -105,3 +109,44 @@ def test_no_matching_condition():
 def test_with_min_visits_no_match():
     patients = PatientBuilder(MockDataset()).with_min_visits(10).build()
     assert patients == []
+
+
+def test_each_filter_and_build_load_patients_again():
+    """Chained filters and build() each call get_patient for their candidates."""
+
+    class CountingDataset(MockDataset):
+        def __init__(self):
+            super().__init__()
+            self.lookups = 0
+
+        def get_patient(self, patient_id):
+            self.lookups += 1
+            return super().get_patient(patient_id)
+
+    dataset = CountingDataset()
+    patients = (
+        PatientBuilder(dataset).with_condition("E11.9").with_min_visits(2).build()
+    )
+    assert [patient.patient_id for patient in patients] == ["1"]
+    # with_condition loads 3 patients, with_min_visits loads the 1 survivor,
+    # and build loads that survivor again.
+    assert dataset.lookups == 5
+
+
+def test_two_diagnoses_qualify_one_ancestor_once_per_row():
+    """Two paths inside one diagnosis count once. Two diagnoses count twice."""
+    one_diagnosis_two_paths = [
+        ConditionRecord("1", "10", "435459", None, None),
+    ]
+    two_diagnoses = [
+        ConditionRecord("1", "10", "435459", None, None),
+        ConditionRecord("2", None, None, "04119", 9),
+    ]
+
+    def rollup(record):
+        if record.diagnosis_id == "1":
+            return ["A", "A", "parent"]
+        return ["A"]
+
+    assert concepts_with_repeated_diagnoses(one_diagnosis_two_paths, rollup) == set()
+    assert concepts_with_repeated_diagnoses(two_diagnoses, rollup) == {"A"}

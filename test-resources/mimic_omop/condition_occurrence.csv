@@ -1,0 +1,7 @@
+condition_occurrence_id,person_id,condition_concept_id,condition_start_date,condition_start_datetime,condition_end_date,condition_end_datetime,condition_type_concept_id,stop_reason,provider_id,visit_occurrence_id,visit_detail_id,condition_source_value,condition_source_concept_id,condition_status_source_value,condition_status_concept_id
+1,1,435459,2180-01-15,2180-01-15 08:00:00,2180-01-18,2180-01-18 12:00:00,32019,,,10,,ICD9CM:04119,44821987,primary,32902
+2,1,0,2180-01-15,2180-01-15 08:00:00,2180-01-18,2180-01-18 12:00:00,32019,,,10,,ICD9CM:04119,44821987,secondary,32908
+3,1,0,2180-06-02,2180-06-02 09:30:00,2180-06-05,2180-06-05 11:00:00,32019,,,11,,ICD10CM:E119,45548194,primary,32902
+4,1,201826,2180-06-02,2180-06-02 09:30:00,2180-06-05,2180-06-05 11:00:00,32019,,,11,,ICD10CM:E119,45548194,secondary,32908
+5,1,201826,2180-06-02,2180-06-02 09:30:00,2180-06-05,2180-06-05 11:00:00,32019,,,11,,ICD10CM:E119,45548194,secondary,32908
+6,1,0,2180-08-01,2180-08-01 10:00:00,2180-08-01,2180-08-01 10:00:00,32019,,,,,ICD10CM:E119,45548194,secondary,32908
