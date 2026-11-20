@@ -55,6 +55,7 @@ CONCEPTS = [
     (102, "Acute MI", "Condition", "SNOMED", "S", "57054005", ""),
     (103, "Acute MI, inferior wall", "Condition", "SNOMED", "S", "73795002", ""),
     (104, "Two-parent disorder", "Condition", "SNOMED", "S", "1000004", ""),
+    (107, "Deep two-parent disorder", "Condition", "SNOMED", "S", "1000107", ""),
     (600, "Cardiac observation", "Observation", "SNOMED", "S", "1000600", ""),
     (105, "Orphan disorder", "Condition", "SNOMED", "S", "1000005", ""),
     (106, "Deep orphan disorder", "Condition", "SNOMED", "S", "1000106", ""),
@@ -83,6 +84,8 @@ RELATIONSHIPS = [
     (103, 102, "Is a", ""),
     (104, 103, "Is a", ""),
     (104, 100, "Is a", ""),
+    (107, 103, "Is a", ""),
+    (107, 140708, "Is a", ""),
     (600, 100, "Is a", ""),
     (105, 600, "Is a", ""),
     (106, 610, "Is a", ""),
@@ -342,6 +345,22 @@ class TestPathSourceModes(_AthenaRollupFixture):
                 self.direct.rollup_codes([code])[0],
                 self.closure.rollup_codes([code])[0],
             )
+
+    def test_deep_multi_parent_targets_under_both_policies(self):
+        # 107 sits at depth 5 under 103 (depth 4 -> 102 -> 101 -> 100) and
+        # 140708 (depth 4 -> 333 -> 222 -> 111).
+        first = self.direct.rollup_codes(["107"])[0]
+        self.assertEqual(first.reason, "rolled_up")
+        self.assertEqual(first.source_depth, 5)
+        self.assertEqual(list(first.targets), ["102", "333"])
+
+        all_ret = self.all_retained.rollup_codes(["107"])[0]
+        self.assertEqual(all_ret.reason, "rolled_up")
+        self.assertEqual(all_ret.source_depth, 5)
+        self.assertEqual(
+            list(all_ret.targets),
+            ["100", "101", "102", "111", "222", "333"],
+        )
 
     @unittest.skipUnless(_has_pyg(), "torch-geometric not installed")
     def test_exact_projected_edges_and_closure_only_mask(self):

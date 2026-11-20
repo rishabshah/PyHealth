@@ -243,6 +243,52 @@ class OMOPVocabulary:
             raise ValueError("max_depth must be non-negative or None.")
         logger.info("Building SNOMED condition hierarchy from %s", self.root)
 
+        subtree = self._rooted_condition_nodes(root_concept_id)
+        nodes = subtree.with_columns(pl.col(f"{depth_measure}_depth").alias("depth"))
+        if max_depth is not None:
+            nodes = nodes.filter(pl.col("depth") <= max_depth)
+        nodes = nodes.sort("depth", "concept_id")
+        node_ids = nodes.select("concept_id").lazy()
+        edges = self._direct_is_a_edges(nodes).with_columns(
+            pl.lit(False).alias("rescued")
+        )
+
+        # Descendants below the cutoff still need their kept ancestors.
+        ancestors = _collect(
+            self.scan("CONCEPT_ANCESTOR")
+            .filter(pl.col("min_levels_of_separation") > 0)
+            .select(
+                pl.col("descendant_concept_id").alias("concept_id"),
+                pl.col("ancestor_concept_id").alias("ancestor_id"),
+                pl.col("min_levels_of_separation").alias("distance"),
+            )
+            .join(subtree.select("concept_id").lazy(), on="concept_id", how="semi")
+            .join(node_ids, left_on="ancestor_id", right_on="concept_id", how="semi")
+        )
+
+        if connect_orphans:
+            edges = _rescue_orphans(nodes, edges, ancestors, root_concept_id).sort(
+                "parent_id", "child_id"
+            )
+        logger.info(
+            "Condition hierarchy: %d concepts, %d edges, %d orphans re-attached",
+            nodes.height,
+            edges.height,
+            int(edges["rescued"].sum()),
+        )
+
+        return OMOPConditionHierarchy(
+            nodes=nodes,
+            edges=edges,
+            ancestors=ancestors.sort("concept_id", "distance", "ancestor_id"),
+            root_concept_id=root_concept_id,
+            max_depth=max_depth,
+            depth_measure=depth_measure,
+            connect_orphans=connect_orphans,
+        )
+
+    def _rooted_condition_nodes(self, root_concept_id: int) -> pl.DataFrame:
+        """Collects the uncut SNOMED Condition subtree with both root depths."""
         conditions = (
             self.scan("CONCEPT")
             .filter(
@@ -263,15 +309,16 @@ class OMOPVocabulary:
             )
         )
         subtree = _collect(levels.join(conditions, on="concept_id", how="inner"))
-        root = _collect(
-            conditions.filter(pl.col("concept_id") == root_concept_id)
-        )
-        if root.height == 0:
-            raise ValueError(
-                f"Root concept {root_concept_id} is not a valid standard SNOMED "
-                "Condition concept in this vocabulary."
-            )
+        # Some bundles omit the root's self-row.
         if root_concept_id not in subtree["concept_id"]:
+            root = _collect(
+                conditions.filter(pl.col("concept_id") == root_concept_id)
+            )
+            if root.height == 0:
+                raise ValueError(
+                    f"Root concept {root_concept_id} is not a valid standard SNOMED "
+                    "Condition concept in this vocabulary."
+                )
             subtree = pl.concat(
                 [
                     subtree,
@@ -281,17 +328,12 @@ class OMOPVocabulary:
                     ).select(subtree.columns),
                 ]
             )
-        subtree = subtree.with_columns(
-            pl.col(f"{depth_measure}_depth").alias("depth")
-        ).unique("concept_id")
+        return subtree.unique("concept_id")
 
-        nodes = subtree
-        if max_depth is not None:
-            nodes = subtree.filter(pl.col("depth") <= max_depth)
-        nodes = nodes.sort("depth", "concept_id")
+    def _direct_is_a_edges(self, nodes: pl.DataFrame) -> pl.DataFrame:
+        """Collects valid direct 'Is a' edges between ``nodes``."""
         node_ids = nodes.select("concept_id").lazy()
-
-        edges = _collect(
+        return _collect(
             self.scan("CONCEPT_RELATIONSHIP")
             .filter((pl.col("relationship_id") == "Is a") & _is_valid())
             .select(
@@ -302,38 +344,7 @@ class OMOPVocabulary:
             .join(node_ids, left_on="child_id", right_on="concept_id", how="semi")
             .filter(pl.col("parent_id") != pl.col("child_id"))
             .unique()
-        ).with_columns(pl.lit(False).alias("rescued"))
-
-        ancestors = _collect(
-            self.scan("CONCEPT_ANCESTOR")
-            .filter(pl.col("min_levels_of_separation") > 0)
-            .select(
-                pl.col("descendant_concept_id").alias("concept_id"),
-                pl.col("ancestor_concept_id").alias("ancestor_id"),
-                pl.col("min_levels_of_separation").alias("distance"),
-            )
-            .join(subtree.select("concept_id").lazy(), on="concept_id", how="semi")
-            .join(node_ids, left_on="ancestor_id", right_on="concept_id", how="semi")
-        )
-
-        if connect_orphans:
-            edges = _rescue_orphans(nodes, edges, ancestors, root_concept_id)
-        logger.info(
-            "Condition hierarchy: %d concepts, %d edges, %d orphans re-attached",
-            nodes.height,
-            edges.height,
-            int(edges["rescued"].sum()),
-        )
-
-        return OMOPConditionHierarchy(
-            nodes=nodes,
-            edges=edges.sort("parent_id", "child_id"),
-            ancestors=ancestors.sort("concept_id", "distance", "ancestor_id"),
-            root_concept_id=root_concept_id,
-            max_depth=max_depth,
-            depth_measure=depth_measure,
-            connect_orphans=connect_orphans,
-        )
+        ).sort("parent_id", "child_id")
 
     def icd_mapper(
         self, versions: Iterable[Union[int, str]] = (9, 10)
