@@ -21,6 +21,13 @@ from .codes.umls import UMLS
 from .cross_map import CrossMap
 from .flat_map import FlatMap
 from .inner_map import InnerMap
+from .omop import (
+    DISEASE_CONCEPT_ID,
+    ICDToSNOMEDMapper,
+    OMOPConditionHierarchy,
+    OMOPVocabulary,
+    OMOPVocabularyFormat,
+)
 
 __all__ = [
     "ATC",
@@ -41,7 +48,12 @@ __all__ = [
     "NDC",
     "UMLS",
     "CrossMap",
+    "DISEASE_CONCEPT_ID",
     "FlatMap",
+    "ICDToSNOMEDMapper",
     "InnerMap",
+    "OMOPConditionHierarchy",
+    "OMOPVocabulary",
+    "OMOPVocabularyFormat",
     "RxNorm",
 ]

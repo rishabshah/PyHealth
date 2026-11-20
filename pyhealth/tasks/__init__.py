@@ -149,6 +149,7 @@ from .patient_linkage_mimic3 import PatientLinkageMIMIC3Task
 from .knowrare_mimic4 import (
     KnowRareICUMortalityMIMIC4 as KnowRareICUMortalityMIMIC4,
 )
+from .keep import build_keep_omop_ancestor_rollup as build_keep_omop_ancestor_rollup
 from .value_set_completion import (
     ValueSetCompletion as ValueSetCompletion,
     build_retrieval_index as build_retrieval_index,

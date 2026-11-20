@@ -160,10 +160,16 @@ test-resources/meds_demo/
 .artifacts/
 examples/.artifacts/
 
-
 # PyHealth cache
 .pyhealth_cache/
 test-resources/.pyhealth_cache/
 
 # parquet files
 *.parquet
+
+# OMOP vocabularies from Athena: licensed, must never be committed
+athena/
+CONCEPT*.csv
+cpt4.jar
+# MIMIC-IV downloads (credentialed data): keep them outside the repo
+mimiciv/
