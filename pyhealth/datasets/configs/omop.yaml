@@ -51,17 +51,12 @@ tables:
           - "visit_end_datetime"
     attributes:
       - "visit_occurrence_id"
-      - "condition_occurrence_id"
       - "condition_concept_id"
-      - "condition_source_value"
       - "condition_start_date"
       - "condition_start_datetime"
       - "condition_end_date"
       - "condition_end_datetime"
       - "condition_type_concept_id"
-      - "condition_source_concept_id"
-      - "condition_status_concept_id"
-      - "condition_status_source_value"
 
   procedure_occurrence:
     file_path: "procedure_occurrence.csv"

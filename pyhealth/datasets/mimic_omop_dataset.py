@@ -6,7 +6,7 @@ from pyhealth.data import Patient
 
 from .omop import OMOPDataset
 
-CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "omop.yaml"
+CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "mimic_omop.yaml"
 
 # OMOP uses 0 when a source code has no standard concept.
 _UNMAPPED_CONCEPTS = {None, "", 0, "0"}
@@ -18,10 +18,18 @@ class MIMICOMOPDataset(OMOPDataset):
     Person, visit, and death tables load through :class:`OMOPDataset`.
     ``condition_occurrence`` is added on top of those defaults so
     :class:`~pyhealth.patient_builder.PatientBuilder` can filter the cohort.
-    Each condition event keeps its diagnosis id, concept id, source value,
-    source concept id, status, dates, and visit id. ``get_condition_code`` returns the
-    standard concept id when one is mapped, and the source code when
-    ``condition_concept_id`` is 0.
+    The opt-in config ``mimic_omop.yaml`` adds ``condition_occurrence_id`` and
+    ``condition_source_value`` to the shared condition columns. Concept id,
+    visit id, and timestamps stay on the shared config. A status concept is
+    not selected, so a converter that omits ``condition_status_concept_id``
+    still loads. An existing OMOP extract keeps using :class:`OMOPDataset`
+    and ``omop.yaml``. ``get_condition_code`` returns the standard concept
+    id when one is mapped, and the source code when ``condition_concept_id``
+    is 0.
+
+    A notebook that should stay on MIMIC-IV uses
+    :class:`~pyhealth.datasets.MIMIC4Dataset` and
+    :class:`~pyhealth.tasks.KeepPatientHistory` instead of this CSV round-trip.
 
     The CSV directory is produced separately; see ``patient_builder/convert.py``
     on the ``patient_builder`` branch.

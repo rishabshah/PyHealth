@@ -1,7 +1,14 @@
+from datetime import datetime
+
+import polars as pl
+import pytest
+
+from pyhealth.data import Patient
 from pyhealth.patient_builder import (
     ConditionRecord,
     PatientBuilder,
     concepts_with_repeated_diagnoses,
+    conflicting_diagnosis_ids,
 )
 
 
@@ -67,6 +74,48 @@ class MockDataset:
             return str(concept)
         return event.condition_source_value
 
+    @property
+    def global_event_df(self):
+        rows = []
+        for patient in self.patients.values():
+            for _visit in patient._visits:
+                rows.append(
+                    {
+                        "patient_id": patient.patient_id,
+                        "event_type": "visit_occurrence",
+                        "timestamp": datetime(2020, 1, 1),
+                        "condition_occurrence/condition_concept_id": None,
+                        "condition_occurrence/condition_source_value": None,
+                    }
+                )
+            for condition in patient._conditions:
+                rows.append(
+                    {
+                        "patient_id": patient.patient_id,
+                        "event_type": "condition_occurrence",
+                        "timestamp": datetime(2020, 1, 2),
+                        "condition_occurrence/condition_concept_id": str(
+                            condition.condition_concept_id
+                        ),
+                        "condition_occurrence/condition_source_value": (
+                            condition.condition_source_value
+                        ),
+                    }
+                )
+        return pl.DataFrame(rows).lazy()
+
+    def iter_patients(self, df=None):
+        frame = self.global_event_df if df is None else df
+        patient_ids = (
+            frame.select("patient_id")
+            .unique(maintain_order=True)
+            .collect()
+            .to_series()
+        )
+        for patient_id in patient_ids:
+            patient_df = frame.filter(pl.col("patient_id") == patient_id).collect()
+            yield Patient(patient_id=str(patient_id), data_source=patient_df)
+
 
 def test_builder_creation():
     builder = PatientBuilder(MockDataset())
@@ -111,26 +160,34 @@ def test_with_min_visits_no_match():
     assert patients == []
 
 
-def test_each_filter_and_build_load_patients_again():
-    """Chained filters and build() each call get_patient for their candidates."""
+def test_filters_stay_lazy_until_patients_are_read():
+    """Chained filters do not load patients. build() loads each survivor once."""
 
     class CountingDataset(MockDataset):
         def __init__(self):
             super().__init__()
             self.lookups = 0
+            self.materialized = 0
 
         def get_patient(self, patient_id):
             self.lookups += 1
             return super().get_patient(patient_id)
 
+        def iter_patients(self, df=None):
+            for patient in super().iter_patients(df):
+                self.materialized += 1
+                yield patient
+
     dataset = CountingDataset()
-    patients = (
-        PatientBuilder(dataset).with_condition("E11.9").with_min_visits(2).build()
-    )
+    builder = PatientBuilder(dataset).with_condition("E11.9").with_min_visits(2)
+    assert dataset.lookups == 0
+    assert dataset.materialized == 0
+    patients = builder.build()
     assert [patient.patient_id for patient in patients] == ["1"]
-    # with_condition loads 3 patients, with_min_visits loads the 1 survivor,
-    # and build loads that survivor again.
-    assert dataset.lookups == 5
+    assert dataset.lookups == 0
+    assert dataset.materialized == 1
+    visits = patients[0].get_events(event_type="visit_occurrence")
+    assert len(visits) == 3
 
 
 def test_two_diagnoses_qualify_one_ancestor_once_per_row():
@@ -150,3 +207,47 @@ def test_two_diagnoses_qualify_one_ancestor_once_per_row():
 
     assert concepts_with_repeated_diagnoses(one_diagnosis_two_paths, rollup) == set()
     assert concepts_with_repeated_diagnoses(two_diagnoses, rollup) == {"A"}
+
+
+def test_conflicting_copies_are_flagged():
+    """Same diagnosis id with two source codes is flagged."""
+    records = [
+        ConditionRecord("1", "10", None, "04119", 9),
+        ConditionRecord("1", "10", None, "04119", 9),
+        ConditionRecord("1", "10", None, "I214", 10),
+        ConditionRecord("2", "11", None, "I214", 10),
+    ]
+
+    def rollup(record):
+        if record.icd_code == "04119":
+            return ["100", "100"]
+        return ["102", "100"]
+
+    assert conflicting_diagnosis_ids(records, rollup) == {"1"}
+
+
+def test_repeated_record_stays_below_the_threshold():
+    """Two copies of one diagnosis count once, before mapping."""
+    record = ConditionRecord("1", "10", "101", None, None)
+    calls = []
+
+    def rollup(item):
+        calls.append(item)
+        return ["101", "101"]
+
+    repeated = concepts_with_repeated_diagnoses([record, record], rollup)
+    assert repeated == set()
+    assert calls == [record]
+
+
+def test_conflicting_diagnosis_raises_before_mapping():
+    """A diagnosis id with two concepts is rejected before rollup."""
+    first = ConditionRecord("1", "10", "101", None, None)
+    conflict = ConditionRecord("1", "10", "102", None, None)
+    second = ConditionRecord("2", "11", "102", None, None)
+
+    def rollup(item):
+        raise AssertionError(item.diagnosis_id)
+
+    with pytest.raises(ValueError, match="Conflicting diagnosis 1"):
+        concepts_with_repeated_diagnoses([first, conflict, second], rollup)

@@ -1,10 +1,11 @@
 """Filter an OMOP dataset down to a cohort of PyHealth patients.
 
-``PatientBuilder`` is a single exact-code cohort filter. One condition row
-whose code equals the requested string selects the patient.
+``PatientBuilder`` composes exact-code filters on the dataset event table.
+One condition row whose code equals the requested string selects the patient.
 ``with_min_visits`` counts every ``visit_occurrence`` event, including visits
 that do not carry the selected diagnosis. Neither filter rolls codes up an
-ontology or requires a code to occur twice.
+ontology or requires a code to occur twice. Patients are loaded when the
+cohort is iterated or collected into a list.
 
 KEEP counts a condition over the whole history after ontology roll-up
 (Appendix A.4). The prototype history task on the ``patient_builder`` branch
@@ -15,25 +16,27 @@ visit are left out of that task. ``condition_records`` keeps those rows and
 the downstream KEEP path.
 """
 
+from collections import Counter
 from dataclasses import dataclass
+
+import polars as pl
 
 from pyhealth.data import Patient
 
 _MISSING = {"", "none", "nan", "<na>", "nat"}
 _ICD_VERSION = {"ICD9CM": 9, "ICD10CM": 10}
+_CONCEPT = "condition_occurrence/condition_concept_id"
+_SOURCE = "condition_occurrence/condition_source_value"
 
 
 class PatientBuilder:
     """Exact-code cohort filter that returns PyHealth :class:`Patient` objects.
 
-    ``with_condition`` keeps a patient when one condition row matches the
-    code. It does not roll that code up to ancestors and does not require a
-    second occurrence. ``with_min_visits`` counts all ``visit_occurrence``
-    events. Each of those filters calls ``dataset.get_patient`` for every
-    candidate, and ``build`` loads the survivors again into one list. That
-    list suits a small cohort. A whole-cohort scan should pass
-    ``dataset.iter_patients()`` to the consumer and aggregate one patient
-    at a time.
+    ``with_condition`` and ``with_min_visits`` add a semi-join to the event
+    table and do not load patients. The join keeps every event of a selected
+    patient, so the cohort still has that patient's full history.
+    ``iter_patients`` loads one patient at a time. ``build`` collects that
+    iterator into a list, which is convenient for a small cohort.
 
     Examples:
         >>> from pyhealth.patient_builder import PatientBuilder
@@ -43,25 +46,44 @@ class PatientBuilder:
         ...     .with_min_visits(2)
         ...     .build()
         ... )  # doctest: +SKIP
+        >>> for patient in (
+        ...     PatientBuilder(dataset).with_min_visits(2).iter_patients()
+        ... ):  # doctest: +SKIP
+        ...     len(patient.get_events(event_type="visit_occurrence"))
     """
 
     def __init__(self, dataset) -> None:
-        """Start a cohort from every patient in ``dataset``.
+        """Start a cohort from every event in ``dataset``.
 
         Args:
-            dataset: An OMOP-backed dataset with ``unique_patient_ids``,
-                ``get_patient``, ``get_condition_code``, and ``get_visit_count``.
-                :class:`~pyhealth.datasets.MIMICOMOPDataset` provides these.
+            dataset: A dataset with ``global_event_df`` and
+                ``iter_patients``. :class:`~pyhealth.datasets.MIMICOMOPDataset`
+                provides these.
         """
         self.dataset = dataset
-        self.patient_ids = list(dataset.unique_patient_ids)
+        self._events = dataset.global_event_df
+
+    @property
+    def patient_ids(self) -> list[str]:
+        """Return the selected patient ids without building patient objects.
+
+        Returns:
+            Patient ids in first-seen order on the filtered event table.
+        """
+        return (
+            self._events.select(pl.col("patient_id").cast(pl.Utf8))
+            .unique(maintain_order=True)
+            .collect(engine="streaming")
+            .to_series()
+            .to_list()
+        )
 
     def with_condition(self, condition_code: str) -> "PatientBuilder":
         """Keep patients with one condition row equal to ``condition_code``.
 
-        One matching row is enough. The comparison is the string from
-        ``get_condition_code``: the standard concept when it is mapped, and
-        the versioned source value when the concept id is 0.
+        One matching row is enough. The comparison is the standard concept
+        when it is mapped, and the versioned source value when the concept
+        id is 0. The plan stays lazy until patients are read.
 
         Args:
             condition_code: Concept id or source code, compared as a string.
@@ -69,23 +91,21 @@ class PatientBuilder:
         Returns:
             This builder, so another filter can be chained.
         """
-        wanted = str(condition_code)
-        filtered_ids = []
-        for patient_id in self.patient_ids:
-            patient = self.dataset.get_patient(patient_id)
-            conditions = patient.get_events(event_type="condition_occurrence")
-            for condition in conditions:
-                if self.dataset.get_condition_code(condition) == wanted:
-                    filtered_ids.append(patient_id)
-                    break
-        self.patient_ids = filtered_ids
-        return self
+        code = _condition_code(self._events)
+        eligible = (
+            self._events.filter(pl.col("event_type") == "condition_occurrence")
+            .filter(code == str(condition_code))
+            .select("patient_id")
+            .unique()
+        )
+        return self._restrict(eligible)
 
     def with_min_visits(self, min_visits: int) -> "PatientBuilder":
         """Keep patients with at least ``min_visits`` visits.
 
         The count is every ``visit_occurrence`` event. A diagnosis that is
-        not linked to a visit does not change this count.
+        not linked to a visit does not change this count. The plan stays
+        lazy until patients are read.
 
         Args:
             min_visits: Minimum number of ``visit_occurrence`` events.
@@ -93,27 +113,44 @@ class PatientBuilder:
         Returns:
             This builder, so another filter can be chained.
         """
-        filtered_ids = []
-        for patient_id in self.patient_ids:
-            patient = self.dataset.get_patient(patient_id)
-            if self.dataset.get_visit_count(patient) >= min_visits:
-                filtered_ids.append(patient_id)
-        self.patient_ids = filtered_ids
-        return self
+        if min_visits <= 0:
+            return self
+        eligible = (
+            self._events.filter(pl.col("event_type") == "visit_occurrence")
+            .group_by("patient_id")
+            .agg(pl.len().alias("n"))
+            .filter(pl.col("n") >= min_visits)
+            .select("patient_id")
+        )
+        return self._restrict(eligible)
+
+    def iter_patients(self):
+        """Load each selected patient when the caller asks for the next one.
+
+        ``dataset.iter_patients`` still reads one patient at a time. The
+        filters have already been joined onto the event table, so only the
+        selected patients are read.
+
+        Returns:
+            An iterator of :class:`~pyhealth.data.Patient` objects. Each one
+            still contains that patient's full event history.
+        """
+        return self.dataset.iter_patients(df=self._events)
 
     def build(self) -> list[Patient]:
-        """Load the remaining patients and keep them all in one list.
+        """Collect the selected patients into one list.
 
-        Each chained filter has already called ``get_patient`` for its
-        candidates. This loads each survivor once more. The list is the
-        right result for a small selected cohort. For a whole-cohort
-        aggregation, pass ``dataset.iter_patients()`` to the consumer
-        instead of calling ``build``.
+        This is the list to inspect for a small cohort. It reads each
+        selected patient once, through :meth:`iter_patients`.
 
         Returns:
             One :class:`~pyhealth.data.Patient` per remaining patient id.
         """
-        return [self.dataset.get_patient(patient_id) for patient_id in self.patient_ids]
+        return list(self.iter_patients())
+
+    def _restrict(self, eligible: pl.LazyFrame) -> "PatientBuilder":
+        self._events = self._events.join(eligible, on="patient_id", how="semi")
+        return self
 
 
 @dataclass(frozen=True)
@@ -169,14 +206,86 @@ def condition_record(event) -> ConditionRecord:
     return ConditionRecord(str(diagnosis_id), _visit_id(event), None, code, version)
 
 
-def concepts_with_repeated_diagnoses(records, rollup, min_diagnoses: int = 2) -> set[str]:
-    """Keep concepts that occur in at least ``min_diagnoses`` distinct rows.
+def collapse_diagnosis_copies(records, rollup) -> list[dict]:
+    """Collapse identical copies and flag copies that disagree.
 
-    ``rollup(record)`` yields the concept ids reached from that diagnosis,
-    including every ancestor path from PR #2. Those ids are unioned inside
-    one ``diagnosis_id`` before they are counted. Two paths from one
-    diagnosis to ancestor A contribute one occurrence. Two diagnoses that
-    each reach A contribute two, so A meets a threshold of 2.
+    Copies that share a ``diagnosis_id`` and the same concept, ICD code, and
+    version become one diagnosis. Copies of that id with a different source
+    stay on the same diagnosis, with ``conflict`` set, and their targets are
+    unioned. One diagnosis then contributes each target once.
+
+    Args:
+        records: Diagnosis rows from :func:`condition_records`.
+        rollup: Callable returning the concept ids for one record.
+
+    Returns:
+        One dict per diagnosis id, in first-seen order, with ``targets`` and
+        ``conflict``.
+
+    Examples:
+        >>> rows = [ConditionRecord("1", "10", None, "04119", 9)]
+        >>> collapse_diagnosis_copies(rows, lambda record: ["100"])[0]["conflict"]
+        False
+    """
+    grouped: dict[str, dict[tuple, set[str]]] = {}
+    order: list[str] = []
+    for record in records:
+        signature = (record.concept_id, record.icd_code, record.icd_version)
+        targets = {str(concept) for concept in rollup(record)}
+        if record.diagnosis_id not in grouped:
+            order.append(record.diagnosis_id)
+            grouped[record.diagnosis_id] = {}
+        copies = grouped[record.diagnosis_id]
+        copies[signature] = copies.get(signature, set()) | targets
+    collapsed = []
+    for diagnosis_id in order:
+        copies = grouped[diagnosis_id]
+        targets: set[str] = set()
+        for copy_targets in copies.values():
+            targets |= copy_targets
+        collapsed.append(
+            {
+                "diagnosis_id": diagnosis_id,
+                "conflict": len(copies) > 1,
+                "targets": targets,
+            }
+        )
+    return collapsed
+
+
+def conflicting_diagnosis_ids(records, rollup) -> set[str]:
+    """Return diagnosis ids whose copies do not carry the same source.
+
+    Args:
+        records: Diagnosis rows from :func:`condition_records`.
+        rollup: Callable returning the concept ids for one record.
+
+    Returns:
+        Diagnosis ids flagged by :func:`collapse_diagnosis_copies`.
+
+    Examples:
+        >>> same = ConditionRecord("1", "10", None, "04119", 9)
+        >>> other = ConditionRecord("1", "10", None, "I214", 10)
+        >>> conflicting_diagnosis_ids([same, other], lambda record: ["100"])
+        {'1'}
+    """
+    return {
+        item["diagnosis_id"]
+        for item in collapse_diagnosis_copies(records, rollup)
+        if item["conflict"]
+    }
+
+
+def concepts_with_repeated_diagnoses(
+    records, rollup, min_diagnoses: int = 2
+) -> set[str]:
+    """Keep concepts that occur in at least ``min_diagnoses`` distinct diagnoses.
+
+    Repeated ids are checked before ``rollup`` runs. An identical copy is
+    kept once. A copy that disagrees on any field raises ``ValueError``.
+    Each remaining diagnosis contributes each mapped target once, so two
+    ancestor paths from one diagnosis count as one occurrence. Two diagnoses
+    that each reach ancestor A contribute two.
 
     Args:
         records: Diagnosis rows from :func:`condition_records`.
@@ -185,16 +294,48 @@ def concepts_with_repeated_diagnoses(records, rollup, min_diagnoses: int = 2) ->
 
     Returns:
         Concept ids whose diagnosis count is at least ``min_diagnoses``.
+
+    Raises:
+        ValueError: The same diagnosis id appears as two different records.
+
+    Examples:
+        >>> one = ConditionRecord("1", "10", "435459", None, None)
+        >>> two = ConditionRecord("2", None, None, "04119", 9)
+        >>> concepts_with_repeated_diagnoses(
+        ...     [one, two], lambda record: ["A"]
+        ... )
+        {'A'}
     """
-    by_diagnosis: dict[str, set[str]] = {}
+    by_id: dict[str, ConditionRecord] = {}
     for record in records:
-        targets = {str(concept) for concept in rollup(record)}
-        by_diagnosis.setdefault(record.diagnosis_id, set()).update(targets)
-    counts: dict[str, int] = {}
-    for targets in by_diagnosis.values():
-        for concept in targets:
-            counts[concept] = counts.get(concept, 0) + 1
+        previous = by_id.setdefault(record.diagnosis_id, record)
+        if previous != record:
+            raise ValueError(f"Conflicting diagnosis {record.diagnosis_id}")
+
+    counts: Counter[str] = Counter()
+    for record in by_id.values():
+        counts.update({str(target) for target in rollup(record)})
     return {concept for concept, count in counts.items() if count >= min_diagnoses}
+
+
+def _condition_code(events: pl.LazyFrame) -> pl.Expr:
+    """Match ``MIMICOMOPDataset.get_condition_code`` on the event table."""
+    names = events.collect_schema().names()
+    if _CONCEPT not in names:
+        return pl.lit(None, dtype=pl.Utf8)
+    concept = pl.col(_CONCEPT).cast(pl.Utf8)
+    unmapped = concept.is_null() | concept.is_in(["", "0"])
+    if _SOURCE not in names:
+        return pl.when(unmapped).then(pl.lit(None, dtype=pl.Utf8)).otherwise(concept)
+    source = pl.col(_SOURCE).cast(pl.Utf8)
+    blank_source = source.is_null() | (source == "")
+    return (
+        pl.when(~unmapped)
+        .then(concept)
+        .when(~blank_source)
+        .then(source)
+        .otherwise(pl.lit(None, dtype=pl.Utf8))
+    )
 
 
 def _visit_id(event) -> str | None:
