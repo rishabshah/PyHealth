@@ -150,6 +150,10 @@ from .knowrare_mimic4 import (
     KnowRareICUMortalityMIMIC4 as KnowRareICUMortalityMIMIC4,
 )
 from .keep import build_keep_omop_ancestor_rollup as build_keep_omop_ancestor_rollup
+from .keep_patient_history import (
+    KeepPatientHistory as KeepPatientHistory,
+    patient_history as patient_history,
+)
 from .value_set_completion import (
     ValueSetCompletion as ValueSetCompletion,
     build_retrieval_index as build_retrieval_index,

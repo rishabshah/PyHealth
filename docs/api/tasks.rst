@@ -260,4 +260,5 @@ Available Tasks
     ICU Acuity and Therapies (MIMIC-IV) <tasks/pyhealth.tasks.ICUAcuityMIMIC4>
     Cancer Mutation Burden (TCGA) <tasks/pyhealth.tasks.CancerMutationBurden>
     KEEP OMOP Ancestor Roll-Up <tasks/pyhealth.tasks.keep>
+    KEEP Patient History (MIMIC-IV) <tasks/pyhealth.tasks.KeepPatientHistory>
     Value Set Completion (VSAC) <tasks/pyhealth.tasks.ValueSetCompletion>

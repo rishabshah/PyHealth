@@ -216,6 +216,8 @@ upload = "twine upload $PX_DIST_DIR/*"
 # use Python built-in unittest library for tests
 [tool.pixi.feature.test.tasks.test]
 cmd = "python -m unittest discover -t tests -s tests/core -p 'test_*.py' -v"
+[tool.pixi.feature.test.tasks.test-patient-builder]
+cmd = "python -m unittest discover -t tests -s tests/patient_builder -p 'test_*.py' -v"
 [tool.pixi.feature.nlp.tasks.testnlp]
 cmd = "python -m unittest discover -t tests -s tests/nlp -p 'test_*.py' -v"
 

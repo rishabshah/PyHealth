@@ -1,0 +1,44 @@
+# Opt-in MIMIC-IV config for a KEEP patient history.
+# diagnoses_icd is not inner-joined to admissions, so a row whose hadm_id
+# matches no admission is kept. KeepPatientHistory reads hadm_id from the
+# admission event when it needs that row's timestamp.
+version: "2.2"
+tables:
+  patients:
+    file_path: "hosp/patients.csv.gz"
+    patient_id: "subject_id"
+    timestamp: null
+    attributes:
+      - "gender"
+      - "anchor_age"
+      - "anchor_year"
+      - "dod"
+
+  admissions:
+    file_path: "hosp/admissions.csv.gz"
+    patient_id: "subject_id"
+    timestamp: "admittime"
+    attributes:
+      - "hadm_id"
+      - "admittime"
+      - "dischtime"
+
+  icustays:
+    file_path: "icu/icustays.csv.gz"
+    patient_id: "subject_id"
+    timestamp: "intime"
+    attributes:
+      - "hadm_id"
+      - "stay_id"
+      - "intime"
+      - "outtime"
+
+  diagnoses_icd:
+    file_path: "hosp/diagnoses_icd.csv.gz"
+    patient_id: "subject_id"
+    timestamp: null
+    attributes:
+      - "hadm_id"
+      - "seq_num"
+      - "icd_code"
+      - "icd_version"
