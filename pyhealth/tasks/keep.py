@@ -326,7 +326,7 @@ class KeepCooccurrenceResult:
     """Number of patients consumed from the iterable."""
 
     patients_with_present_targets: int
-    """Patients with at least one present (two-diagnosis) target."""
+    """Patients with at least one target satisfying the configured occurrence rule."""
 
     unique_diagnosis_events: int
     """Diagnosis rows after collapsing identical copies of one id."""
@@ -357,6 +357,8 @@ def build_keep_cooccurrence(
     icd_mapper: ICDToSNOMEDMapper,
     concept_ids: Sequence[str],
     matrix_builder: _MatrixBuilder = build_cooccurrence,
+    min_occurrences: int = PRESENCE_THRESHOLD,
+    occurrence_unit: str = "diagnosis",
 ) -> KeepCooccurrenceResult:
     """Builds the sparse patient co-occurrence matrix over rolled-up codes.
 
@@ -378,8 +380,15 @@ def build_keep_cooccurrence(
     under ``"empty"``, events with any target count as mapped and wholly
     unmapped events are counted once by reason.
 
-    A target is *present* for a patient after two distinct diagnoses resolve
-    to it. Each unordered pair of present targets counts once per patient,
+    A target is *present* after ``min_occurrences`` distinct diagnoses or
+    admissions support it, after mapping and roll-up. The default remains
+    two diagnoses. Admission support uses ``visit_occurrence_id``: callers
+    must supply admission-level IDs, rather than arbitrary encounter IDs.
+    A mapped diagnosis with a missing admission ID raises in admission mode.
+    Unmapped diagnoses do not supply support. Several diagnoses in one
+    admission contribute once per target; identical admission IDs in different
+    patients are independent. Each unordered pair of present targets counts
+    once per patient,
     off-diagonal entries are mirrored, and the diagonal holds the patient
     prevalence of each concept.
 
@@ -399,6 +408,10 @@ def build_keep_cooccurrence(
             graph, the matrix axes, and later embeddings share this order.
             Isolated concepts and concepts absent from the cohort keep zero
             rows and columns.
+        min_occurrences: positive integer support threshold; booleans are rejected.
+        occurrence_unit: ``"diagnosis"`` or ``"admission"``. Admission mode
+            requires a nonempty visit ID on each mapped diagnosis. Diagnosis
+            mode retains rows without visit IDs.
         matrix_builder: callable that consumes the patient concept sets once
             before returning the sparse matrix with the supplied axes.
             Use ``functools.partial`` with
@@ -411,11 +424,13 @@ def build_keep_cooccurrence(
         tuple, and the patient, diagnosis, and mapping counts.
 
     Raises:
-        TypeError: ``patients`` is not an iterable of patients, an element
+        TypeError: ``min_occurrences`` is not an integer, or
+            ``patients`` is not an iterable of patients, an element
             lacks ``patient_id``/``get_events``, ``rollup`` or ``icd_mapper``
             lacks its required method, or ``concept_ids`` is not a sequence
             of strings.
-        ValueError: a repeated patient id, a missing or empty diagnosis id,
+        ValueError: invalid occurrence settings, a missing admission ID in
+            admission mode, a repeated patient id, a missing or empty diagnosis id,
             conflicting copies of one diagnosis id, or invalid axes
             (duplicate, missing, or extra concept ids).
         UnmappedCodeError: a diagnosis cannot be mapped under the
@@ -500,12 +515,14 @@ def build_keep_cooccurrence(
         rollup=rollup,
         concept_ids=concept_ids,
         matrix_builder=matrix_builder,
+        min_occurrences=min_occurrences,
+        occurrence_unit=occurrence_unit,
     )
 
 
 def _omop_diagnoses(
     patients: Iterable[Patient], icd_mapper: ICDToSNOMEDMapper
-) -> Iterator[tuple[str, Iterable[tuple[Sequence[str], str | None]]]]:
+) -> Iterator[tuple[str, Iterable[tuple[Sequence[str], str | None, str | None]]]]:
     """Adapt raw OMOP patient events to the KEEP diagnosis input."""
     for position, patient in enumerate(patients):
         patient_id = _omop_patient_id(patient, position)
@@ -514,19 +531,28 @@ def _omop_diagnoses(
 
 def _resolve_omop_diagnoses(
     patient: Patient, patient_id: str, icd_mapper: ICDToSNOMEDMapper
-) -> Iterator[tuple[Sequence[str], str | None]]:
+) -> Iterator[tuple[Sequence[str], str | None, str | None]]:
     diagnoses = _collapsed_diagnoses(_condition_events(patient, patient_id), patient_id)
-    for concept, source, _, _ in diagnoses.values():
-        yield _resolve_canonical_ids(concept, source, icd_mapper)
+    for concept, source, _, visit_id in diagnoses.values():
+        canonical_ids, reason = _resolve_canonical_ids(concept, source, icd_mapper)
+        yield canonical_ids, reason, visit_id
 
 
 def _build_keep_result(
-    patients: Iterable[tuple[str, Iterable[tuple[Sequence[str], str | None]]]],
+    patients: Iterable[tuple[str, Iterable[tuple[Sequence[str], str | None, str | None]]]],
     *,
     rollup: AncestorRollupProcessor,
     concept_ids: Sequence[str],
     matrix_builder: _MatrixBuilder,
+    min_occurrences: int,
+    occurrence_unit: str,
 ) -> KeepCooccurrenceResult:
+    if type(min_occurrences) is not int:
+        raise TypeError("min_occurrences must be a positive integer")
+    if min_occurrences < 1:
+        raise ValueError("min_occurrences must be a positive integer")
+    if occurrence_unit not in ("diagnosis", "admission"):
+        raise ValueError("occurrence_unit must be diagnosis or admission")
     if not callable(getattr(rollup, "rollup_codes", None)) or not hasattr(
         rollup, "retained_codes"
     ):
@@ -553,7 +579,8 @@ def _build_keep_result(
                 )
             seen_patient_ids.add(patient_id)
             target_counts: Counter[str] = Counter()
-            for canonical_ids, reason in diagnoses:
+            admission_targets: dict[str, set[str]] = {}
+            for canonical_ids, reason, visit_id in diagnoses:
                 unique_diagnosis_events += 1
                 if reason is not None:
                     unmapped_events[reason] += 1
@@ -565,12 +592,23 @@ def _build_keep_result(
                 }
                 if targets:
                     mapped_events += 1
-                    target_counts.update(targets)
+                    if occurrence_unit == "diagnosis":
+                        target_counts.update(targets)
+                    else:
+                        if visit_id is None:
+                            raise ValueError(
+                                "admission occurrence rule requires a nonempty "
+                                "visit ID on every mapped diagnosis"
+                            )
+                        admission_targets.setdefault(visit_id, set()).update(targets)
                 else:
                     unmapped_events["empty_rollup"] += 1
+            if occurrence_unit == "admission":
+                for targets in admission_targets.values():
+                    target_counts.update(targets)
             present = {
                 code for code, count in target_counts.items()
-                if count >= PRESENCE_THRESHOLD
+                if count >= min_occurrences
             }
             patients_with_present_targets += bool(present)
             yield present
@@ -933,16 +971,23 @@ class KeepConditionHistoryTask(BaseTask):
         rollup: AncestorRollupProcessor,
         concept_ids: Sequence[str],
         matrix_builder: _MatrixBuilder = build_cooccurrence,
+        min_occurrences: int = PRESENCE_THRESHOLD,
+        occurrence_unit: str = "diagnosis",
     ) -> KeepCooccurrenceResult:
         """Count a cohort of MIMIC histories returned by ``dataset.set_task(self)``.
 
         The existing mapped IDs and unmapped reasons feed the same roll-up
         and presence rules used for OMOP. The builder consumes the cohort
         stream synchronously using the supplied axis order.
+        ``min_occurrences`` and ``occurrence_unit`` have the same semantics
+        as :func:`build_keep_cooccurrence`; admission mode uses the history
+        record's ``visit_id`` (MIMIC admission ID). These options change counting,
+        not the cached raw histories.
 
         Example:
             >>> result = task.build_cooccurrence(  # doctest: +SKIP
             ...     histories, rollup=processor, concept_ids=axes,
+            ...     min_occurrences=2, occurrence_unit="admission",
             ... )
         """
         return _build_keep_result(
@@ -953,12 +998,14 @@ class KeepConditionHistoryTask(BaseTask):
             rollup=rollup,
             concept_ids=concept_ids,
             matrix_builder=matrix_builder,
+            min_occurrences=min_occurrences,
+            occurrence_unit=occurrence_unit,
         )
 
 
 def _mimic_diagnoses(
     conditions: Iterable[Mapping[str, Any]],
-) -> Iterator[tuple[Sequence[str], str | None]]:
+) -> Iterator[tuple[Sequence[str], str | None, str | None]]:
     """Read mapped IDs directly from one sample's distinct diagnoses."""
     seen: dict[str, Mapping[str, Any]] = {}
     for condition in conditions:
@@ -970,4 +1017,8 @@ def _mimic_diagnoses(
                 raise ValueError("MIMIC contains conflicting copies of a diagnosis")
             continue
         seen[diagnosis_id] = condition
-        yield condition["concept_ids"], condition["unmapped_reason"]
+        yield (
+            condition["concept_ids"],
+            condition["unmapped_reason"],
+            _visit_key(condition.get("visit_id")),
+        )

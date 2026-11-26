@@ -127,6 +127,40 @@ multi-parent roll-up and a vocabulary shared with the Node2Vec graph; the
 diagnosis-row identity, the post-roll-up thresholding, the prevalence
 diagonal and the mirrored pair counts are this project's choices.
 
+Occurrence-rule experiments
+---------------------------
+
+Both ``build_keep_cooccurrence`` and ``task.build_cooccurrence`` accept
+``min_occurrences`` (a positive integer, default 2) and ``occurrence_unit``
+(``"diagnosis"`` by default, or ``"admission"``). Thresholding always follows
+ICD mapping and ancestor roll-up. Changing the threshold does not change
+raw-history caches, patient membership, retained axes, or mapping diagnostics.
+
+Diagnosis support counts distinct diagnosis identities; admission support unions
+all mapped targets within each patient's admission before counting admissions.
+The caller must supply admission-level ``visit_occurrence_id`` / ``visit_id``
+values. A generic OMOP visit ID is not necessarily an admission ID. In admission
+mode a mapped diagnosis without a usable ID raises ``ValueError``. Unmapped
+rows provide no support. Diagnosis mode continues to allow missing visit IDs.
+
+.. code-block:: python
+
+    result = task.build_cooccurrence(
+        histories, rollup=processor, concept_ids=concept_ids,
+        min_occurrences=2, occurrence_unit="admission",
+    )
+
+``examples/keep_occurrence_rule_ablation.ipynb`` compares one, two, and three
+diagnosis rows with two admissions on ten invented patient histories. Its helper
+uses the public OMOP and mapped-MIMIC counters, an independent trace counter,
+and literal expected presence/counts. It reuses the ancestor-rollup example's
+fixed dense/direct graph; it does not establish a new baseline or evaluate
+clinical data. Run the same assertions headlessly with a fresh output directory:
+
+.. code-block:: console
+
+    python -m examples.keep_occurrence_rule_ablation --output /tmp/keep-occurrence-new
+
 Synthetic example
 -----------------
 
