@@ -50,8 +50,11 @@ diagnoses up to the current admission. The same samples are featurized as:
 * ``uncut``: mapped concepts under "Disease" with no depth limit.
 
 Samples that any arm leaves empty are dropped from every arm, so all arms
-use identical patients, labels and patient-level 70/10/20 splits. Each arm
-trains ``pyhealth.models.LogisticRegression`` with ``Trainer`` (Adam, model
+use identical patients, labels and patient-level 70/10/20 splits
+(``PatientSplit``, chosen once per seed and shared by every arm). Each arm
+fits its code vocabulary on that seed's training patients only and reuses it
+for validation and test (unseen codes map to ``<unk>``), then trains
+``pyhealth.models.LogisticRegression`` with ``Trainer`` (Adam, model
 selection on validation ROC-AUC) and reports test ROC-AUC and PR-AUC, mean
 and standard deviation over seeds.
 
@@ -119,13 +122,10 @@ from examples.keep_depth_mortality_utils import (
     ConceptFeaturizer,
     ConditionMortalityMIMIC4,
     featurize_arms,
+    fit_on_train,
+    patient_folds,
 )
-from pyhealth.datasets import (
-    MIMIC4Dataset,
-    create_sample_dataset,
-    get_dataloader,
-    split_by_patient,
-)
+from pyhealth.datasets import MIMIC4Dataset, get_dataloader
 from pyhealth.medcode import OMOPVocabulary
 from pyhealth.models import LogisticRegression
 from pyhealth.tasks import KeepConditionHistoryTask, build_keep_omop_ancestor_rollup
@@ -297,11 +297,10 @@ def run_matrix_ablation(dataset, vocabulary, release, processors, depths, args):
     return summaries
 
 
-def _scores(dataset, seed, args) -> Dict[str, float]:
-    """Trains and tests one LogisticRegression on one patient-level split."""
-    train, val, test = split_by_patient(dataset, [0.7, 0.1, 0.2], seed=seed)
+def _scores(train, val, test, seed, args) -> Dict[str, float]:
+    """Trains on ``train`` (fitted there), selects on ``val``, scores ``test``."""
     torch.manual_seed(seed)
-    model = LogisticRegression(dataset=dataset, embedding_dim=args.embedding_dim)
+    model = LogisticRegression(dataset=train, embedding_dim=args.embedding_dim)
     trainer = Trainer(
         model=model, metrics=["roc_auc", "pr_auc"], device="cpu", enable_logging=False
     )
@@ -334,23 +333,29 @@ def run_model_ablation(dataset, vocabulary, processors, depths, args):
         featurizers[f"depth_{depth}"] = ConceptFeaturizer(mapper, processors[depth])
     featurizers["uncut"] = ConceptFeaturizer(mapper, processors[UNCUT_DEPTH])
     arms = featurize_arms(samples, featurizers)
+    # Patient folds are chosen once per seed and shared by every arm (all arms
+    # hold the same samples in the same order); each arm then fits its code
+    # vocabulary on that seed's training patients only.
+    reference_arm = next(iter(arms.values()))
+    folds = {seed: patient_folds(reference_arm, seed) for seed in range(args.seeds)}
     report = {}
     for name, arm_samples in arms.items():
-        # Built once per arm; seeds change only the split and initialization.
-        dataset = create_sample_dataset(
-            arm_samples,
-            {"conditions": "sequence"},
-            {"mortality": "binary"},
-            dataset_name="mimic4_keep_depth",
-            task_name=f"condition_mortality_{name}",
-        )
-        runs = [_scores(dataset, seed, args) for seed in range(args.seeds)]
+        runs, train_vocabulary = [], []
+        for seed, fold in folds.items():
+            train, val, test = fit_on_train(
+                arm_samples, fold, task_name=f"condition_mortality_{name}"
+            )
+            train_vocabulary.append(
+                len(train.input_processors["conditions"].code_vocab)
+            )
+            runs.append(_scores(train, val, test, seed, args))
         tokens = [len(s["conditions"]) for s in arm_samples]
         report[name] = {
             "samples": len(arm_samples),
             "positive_rate": sum(s["mortality"] for s in arm_samples)
             / len(arm_samples),
             "vocabulary": len({t for s in arm_samples for t in s["conditions"]}),
+            "train_vocabulary": statistics.fmean(train_vocabulary),
             "tokens_per_sample": statistics.fmean(tokens),
         }
         for metric in ("roc_auc", "pr_auc"):

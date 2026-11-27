@@ -15,7 +15,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
+from pyhealth.datasets import PatientSplit, create_sample_dataset
 from pyhealth.tasks import BaseTask
+
+#: Patient-level train / validation / test fractions.
+SPLIT_RATIOS = (0.7, 0.1, 0.2)
+INPUT_SCHEMA = {"conditions": "sequence"}
+OUTPUT_SCHEMA = {"mortality": "binary"}
 
 # --- downstream prediction ----------------------------------------------------
 
@@ -134,3 +140,68 @@ def featurize_arms(
         for name, tokens in features.items():
             arms[name].append({**sample, "conditions": tokens})
     return arms
+
+
+def patient_folds(samples: Sequence[Mapping[str, Any]], seed: int) -> List[List[int]]:
+    """Patient-level train / validation / test sample indices for one seed.
+
+    Uses PyHealth's :class:`~pyhealth.datasets.PatientSplit` (patients sorted
+    by ID, then shuffled with ``seed``), so every arm built by
+    :func:`featurize_arms` (same samples, same order) gets the same folds.
+
+    Args:
+        samples: One arm's samples.
+        seed: Split seed.
+
+    Returns:
+        Three sorted lists of sample indices.
+    """
+    patient_to_index: Dict[str, List[int]] = {}
+    for index, sample in enumerate(samples):
+        patient_to_index.setdefault(str(sample["patient_id"]), []).append(index)
+    parts = PatientSplit(ratios=SPLIT_RATIOS, seed=seed).split_indices(patient_to_index)
+    return [sorted(int(i) for i in part) for part in parts]
+
+
+def fit_on_train(
+    samples: Sequence[Mapping[str, Any]],
+    folds: Sequence[Sequence[int]],
+    task_name: str,
+):
+    """Builds train / validation / test datasets with train-fitted processors.
+
+    The code vocabulary and label processor are fitted on the training
+    patients only, then reused unchanged for validation and test, so a code
+    seen only in held-out patients maps to ``<unk>``.
+
+    Args:
+        samples: One arm's samples.
+        folds: Output of :func:`patient_folds`.
+        task_name: Name recorded on the datasets.
+
+    Returns:
+        ``(train, validation, test)`` sample datasets.
+    """
+    train_part, *held_out = [[dict(samples[i]) for i in fold] for fold in folds]
+    train = create_sample_dataset(
+        train_part,
+        INPUT_SCHEMA,
+        OUTPUT_SCHEMA,
+        dataset_name="mimic4_keep_depth",
+        task_name=task_name,
+    )
+    fitted = {
+        "input_processors": train.input_processors,
+        "output_processors": train.output_processors,
+    }
+    return (train,) + tuple(
+        create_sample_dataset(
+            part,
+            INPUT_SCHEMA,
+            OUTPUT_SCHEMA,
+            dataset_name="mimic4_keep_depth",
+            task_name=task_name,
+            **fitted,
+        )
+        for part in held_out
+    )

@@ -11,6 +11,8 @@ from examples.keep_depth_mortality_utils import (
     ConceptFeaturizer,
     ConditionMortalityMIMIC4,
     featurize_arms,
+    fit_on_train,
+    patient_folds,
 )
 
 
@@ -102,6 +104,56 @@ class TestConditionMortalityTask(unittest.TestCase):
         self.assertEqual(task(child), [])
         self.assertEqual(task(single), [])
         self.assertEqual(task(no_history), [])
+
+
+def _unique_code_samples(n=40):
+    """The review's fixture: every patient has its own code; one positive."""
+    return [
+        {
+            "patient_id": f"p{i}",
+            "visit_id": f"v{i}",
+            "conditions": [f"unique_{i}"],
+            "mortality": int(i == 0),
+        }
+        for i in range(n)
+    ]
+
+
+class TestTrainFittedVocabulary(unittest.TestCase):
+    def test_folds_are_patient_level_and_shared_by_arms(self):
+        samples = _unique_code_samples()
+        samples.append({**samples[3], "visit_id": "v3b"})  # p3 has two samples
+        train, val, test = patient_folds(samples, seed=0)
+        self.assertEqual(sorted(train + val + test), list(range(len(samples))))
+        owners = [
+            {samples[i]["patient_id"] for i in part} for part in (train, val, test)
+        ]
+        self.assertFalse(
+            owners[0] & owners[1] or owners[0] & owners[2] or owners[1] & owners[2]
+        )
+        # another arm: same samples and order, different tokens -> same folds
+        other_arm = [{**s, "conditions": ["X"]} for s in samples]
+        self.assertEqual(patient_folds(other_arm, seed=0), [train, val, test])
+        self.assertNotEqual(patient_folds(samples, seed=1), [train, val, test])
+
+    def test_held_out_only_code_maps_to_unknown(self):
+        samples = _unique_code_samples()
+        folds = patient_folds(samples, seed=0)
+        train, val, test = fit_on_train(samples, folds, task_name="t")
+        processor = train.input_processors["conditions"]
+        unknown = processor.code_vocab["<unk>"]
+        test_patient = samples[folds[2][0]]
+        code = test_patient["conditions"][0]
+        self.assertNotIn(code, processor.code_vocab)
+        self.assertEqual(processor.process([code]).tolist(), [unknown])
+        # validation and test reuse the train-fitted processors unchanged
+        self.assertIs(test.input_processors["conditions"], processor)
+        self.assertIs(
+            val.output_processors["mortality"], train.output_processors["mortality"]
+        )
+        self.assertEqual(test[0]["conditions"].tolist(), [unknown])
+        train_codes = {samples[i]["conditions"][0] for i in folds[0]}
+        self.assertTrue(train_codes <= set(processor.code_vocab))
 
 
 if __name__ == "__main__":
