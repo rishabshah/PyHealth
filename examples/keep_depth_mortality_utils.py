@@ -13,6 +13,8 @@ These helpers build those samples; the matrix measures live separately in
 
 from __future__ import annotations
 
+import math
+import statistics
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 from pyhealth.datasets import PatientSplit, create_sample_dataset
@@ -205,3 +207,78 @@ def fit_on_train(
         )
         for part in held_out
     )
+
+
+PART_NAMES = ("train", "validation", "test")
+
+
+def fold_counts(
+    samples: Sequence[Mapping[str, Any]], folds: Sequence[Sequence[int]]
+) -> Dict[str, Dict[str, int]]:
+    """Sample and positive counts of each part of one seed's folds."""
+    return {
+        name: {
+            "samples": len(fold),
+            "positives": sum(int(samples[i]["mortality"]) for i in fold),
+        }
+        for name, fold in zip(PART_NAMES, folds)
+    }
+
+
+def check_class_coverage(
+    samples: Sequence[Mapping[str, Any]], folds: Sequence[Sequence[int]], seed: int
+) -> Dict[str, Dict[str, int]]:
+    """Fails clearly unless train, validation and test each hold both labels.
+
+    ROC-AUC and PR-AUC are undefined on a one-class part (scikit-learn returns
+    NaN or raises), and a one-class validation part gives no basis for picking
+    the best epoch. Folds are shared by every arm, so this is checked once per
+    seed before any arm trains.
+
+    Returns:
+        The :func:`fold_counts` of the seed, when every part is usable.
+
+    Raises:
+        ValueError: Naming the seed and each part's sample / positive counts.
+    """
+    counts = fold_counts(samples, folds)
+    bad = [
+        name
+        for name, part in counts.items()
+        if part["positives"] == 0 or part["positives"] == part["samples"]
+    ]
+    if bad:
+        detail = ", ".join(
+            f"{name} {part['positives']}/{part['samples']} positive"
+            for name, part in counts.items()
+        )
+        raise ValueError(
+            f"Seed {seed}: {', '.join(bad)} would have a single class ({detail}). "
+            "Use a larger cohort, or different seeds or split ratios."
+        )
+    return counts
+
+
+def summarize_scores(
+    runs: Mapping[int, Mapping[str, float]], arm: str, metrics: Sequence[str]
+) -> Dict[str, Any]:
+    """Per-seed scores plus mean and standard deviation, all finite.
+
+    Raises:
+        ValueError: If any seed's score is not finite; seeds are never
+            dropped silently.
+    """
+    summary: Dict[str, Any] = {}
+    for metric in metrics:
+        values = [float(runs[seed][metric]) for seed in sorted(runs)]
+        bad = [
+            seed
+            for seed, value in zip(sorted(runs), values)
+            if not math.isfinite(value)
+        ]
+        if bad:
+            raise ValueError(f"Arm {arm!r}: {metric} is not finite for seed(s) {bad}.")
+        summary[metric] = statistics.fmean(values)
+        summary[f"{metric}_std"] = statistics.stdev(values) if len(values) > 1 else 0.0
+        summary[f"{metric}_per_seed"] = values
+    return summary

@@ -10,9 +10,12 @@ from types import SimpleNamespace
 from examples.keep_depth_mortality_utils import (
     ConceptFeaturizer,
     ConditionMortalityMIMIC4,
+    check_class_coverage,
     featurize_arms,
     fit_on_train,
+    fold_counts,
     patient_folds,
+    summarize_scores,
 )
 
 
@@ -154,6 +157,35 @@ class TestTrainFittedVocabulary(unittest.TestCase):
         self.assertEqual(test[0]["conditions"].tolist(), [unknown])
         train_codes = {samples[i]["conditions"][0] for i in folds[0]}
         self.assertTrue(train_codes <= set(processor.code_vocab))
+
+
+class TestEvaluationGuards(unittest.TestCase):
+    def test_one_positive_cohort_fails_clearly_before_training(self):
+        samples = _unique_code_samples()  # one positive patient in 40
+        for seed in range(3):
+            folds = patient_folds(samples, seed)
+            with self.assertRaisesRegex(ValueError, rf"Seed {seed}: .*single class"):
+                check_class_coverage(samples, folds, seed)
+
+    def test_usable_folds_return_counts(self):
+        samples = [
+            {**s, "mortality": i % 2} for i, s in enumerate(_unique_code_samples())
+        ]
+        folds = patient_folds(samples, seed=0)
+        counts = check_class_coverage(samples, folds, seed=0)
+        self.assertEqual(counts, fold_counts(samples, folds))
+        self.assertEqual(sum(c["samples"] for c in counts.values()), 40)
+        self.assertEqual(sum(c["positives"] for c in counts.values()), 20)
+
+    def test_scores_keep_every_seed_and_reject_non_finite(self):
+        runs = {0: {"roc_auc": 0.6}, 1: {"roc_auc": 0.8}, 2: {"roc_auc": 0.7}}
+        summary = summarize_scores(runs, "depth_5", ["roc_auc"])
+        self.assertAlmostEqual(summary["roc_auc"], 0.7)
+        self.assertAlmostEqual(summary["roc_auc_std"], 0.1)
+        self.assertEqual(summary["roc_auc_per_seed"], [0.6, 0.8, 0.7])
+        runs[1]["roc_auc"] = float("nan")
+        with self.assertRaisesRegex(ValueError, r"'depth_5'.*seed\(s\) \[1\]"):
+            summarize_scores(runs, "depth_5", ["roc_auc"])
 
 
 if __name__ == "__main__":

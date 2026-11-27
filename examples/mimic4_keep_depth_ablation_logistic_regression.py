@@ -56,7 +56,11 @@ fits its code vocabulary on that seed's training patients only and reuses it
 for validation and test (unseen codes map to ``<unk>``), then trains
 ``pyhealth.models.LogisticRegression`` with ``Trainer`` (Adam, model
 selection on validation ROC-AUC) and reports test ROC-AUC and PR-AUC, mean
-and standard deviation over seeds.
+and standard deviation over seeds, plus each seed's score. Before any
+training, each seed's folds must give train, validation and test both labels;
+otherwise the run stops with the per-part counts instead of producing NaN
+scores. Non-finite scores also stop the run rather than being averaged or
+dropped.
 
 Expected effects (from the proposal): shallower graphs have fewer concepts
 with more codes per concept, so prevalence and pair counts concentrate on
@@ -121,9 +125,11 @@ from examples.keep_depth_ablation_utils import (
 from examples.keep_depth_mortality_utils import (
     ConceptFeaturizer,
     ConditionMortalityMIMIC4,
+    check_class_coverage,
     featurize_arms,
     fit_on_train,
     patient_folds,
+    summarize_scores,
 )
 from pyhealth.datasets import MIMIC4Dataset, get_dataloader
 from pyhealth.medcode import OMOPVocabulary
@@ -338,9 +344,15 @@ def run_model_ablation(dataset, vocabulary, processors, depths, args):
     # vocabulary on that seed's training patients only.
     reference_arm = next(iter(arms.values()))
     folds = {seed: patient_folds(reference_arm, seed) for seed in range(args.seeds)}
-    report = {}
+    # Labels are identical in every arm, so one check per seed covers them all,
+    # and it runs before any training.
+    fold_report = {
+        seed: check_class_coverage(reference_arm, fold, seed)
+        for seed, fold in folds.items()
+    }
+    report: Dict[str, Any] = {}
     for name, arm_samples in arms.items():
-        runs, train_vocabulary = [], []
+        runs, train_vocabulary = {}, []
         for seed, fold in folds.items():
             train, val, test = fit_on_train(
                 arm_samples, fold, task_name=f"condition_mortality_{name}"
@@ -348,7 +360,7 @@ def run_model_ablation(dataset, vocabulary, processors, depths, args):
             train_vocabulary.append(
                 len(train.input_processors["conditions"].code_vocab)
             )
-            runs.append(_scores(train, val, test, seed, args))
+            runs[seed] = _scores(train, val, test, seed, args)
         tokens = [len(s["conditions"]) for s in arm_samples]
         report[name] = {
             "samples": len(arm_samples),
@@ -358,13 +370,8 @@ def run_model_ablation(dataset, vocabulary, processors, depths, args):
             "train_vocabulary": statistics.fmean(train_vocabulary),
             "tokens_per_sample": statistics.fmean(tokens),
         }
-        for metric in ("roc_auc", "pr_auc"):
-            values = [run[metric] for run in runs]
-            report[name][metric] = statistics.fmean(values)
-            report[name][f"{metric}_std"] = (
-                statistics.stdev(values) if len(values) > 1 else 0.0
-            )
-    return report
+        report[name].update(summarize_scores(runs, name, ("roc_auc", "pr_auc")))
+    return report, fold_report
 
 
 # --- reporting ----------------------------------------------------------------
@@ -373,6 +380,8 @@ def run_model_ablation(dataset, vocabulary, processors, depths, args):
 def _fmt(value) -> str:
     if value is None:
         return "-"
+    if isinstance(value, (list, tuple)):
+        return "/".join(f"{v:.2f}" for v in value)
     if isinstance(value, float):
         return f"{value:.3f}" if abs(value) < 1000 else f"{value:,.0f}"
     if isinstance(value, int):
@@ -384,11 +393,16 @@ def print_table(title: str, columns: Dict[str, Dict[str, Any]]) -> None:
     names = list(columns)
     keys = list(next(iter(columns.values())))
     width = max(len(k) for k in keys) + 2
+    cell = 2 + max(
+        [len(str(n)) for n in names]
+        + [len(_fmt(columns[n][k])) for n in names for k in keys]
+    )
     print(f"\n{title}")
-    print(" " * width + "".join(f"{n:>12}" for n in names))
+    print(" " * width + "".join(f"{n:>{cell}}" for n in names))
     for key in keys:
         print(
-            f"{key:<{width}}" + "".join(f"{_fmt(columns[n][key]):>12}" for n in names)
+            f"{key:<{width}}"
+            + "".join(f"{_fmt(columns[n][key]):>{cell}}" for n in names)
         )
 
 
@@ -487,8 +501,18 @@ def main(argv=None) -> Dict[str, Any]:
                 {f"depth {d}": s for d, s in output["cooccurrence"].items()},
             )
         if not args.skip_model:
-            output["mortality"] = run_model_ablation(
+            output["mortality"], output["folds"] = run_model_ablation(
                 dataset, vocabulary, processors, depths, args
+            )
+            print_table(
+                "Patient folds shared by every arm (samples / positives)",
+                {
+                    f"seed {seed}": {
+                        part: f"{c['samples']:,} / {c['positives']:,}"
+                        for part, c in counts.items()
+                    }
+                    for seed, counts in output["folds"].items()
+                },
             )
             print_table(
                 "Next-admission mortality, LogisticRegression (test set)",
