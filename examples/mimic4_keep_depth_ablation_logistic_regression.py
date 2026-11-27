@@ -9,11 +9,37 @@ KEEP (Elhussein et al., CHIL 2025, https://arxiv.org/abs/2510.05049) keeps
 standard SNOMED Condition concepts at most **5** levels below "Disease"
 (shortest path in ``CONCEPT_ANCESTOR``) and rolls each deeper code up to its
 retained ancestors. This script changes only that depth (3, 4, 5, 6) and
-measures what it does, holding everything else at the KEEP profile used in
-``pyhealth.tasks.keep``: ``target_policy="first_retained"`` (each branch stops
-at its nearest retained ancestor; the proposal's "all nearest retained
-ancestors"), ``path_source="closure"``, ``include_root=False``, two distinct
-diagnoses for a concept to count as present.
+measures what it does; every other setting is held at the reference below.
+
+Reference configuration
+-----------------------
+Every arm differs from this reference in one setting only, the depth:
+
+* ``max_depth=5`` (KEEP's setting; the reference column in every table);
+* ``target_policy="first_retained"``: each branch stops at its nearest
+  retained ancestor (the proposal's "all nearest retained ancestors");
+* ``path_source="closure"``, ``include_root=False``, ``on_unmapped="empty"``;
+* a concept is present for a patient after ``PRESENCE_THRESHOLD`` (2)
+  distinct diagnoses resolve to it;
+* the same cohort and the same diagnosis histories for every depth;
+* the Athena release, recorded in the output's ``reference`` block.
+
+The output JSON repeats this under ``reference``. Note that our reproduction
+baseline (#7) uses ``target_policy="all_retained"`` with
+``path_source="direct"``; ``first_retained`` and ``closure`` are a named
+variant here, and #8 studies closure separately. To run this ablation around
+that baseline instead, add ``--policy all_retained --path-source direct``.
+Once those branches merge, the default will move to the reproduction
+reference and the other settings become one-at-a-time comparators.
+
+Two experiments, two questions
+------------------------------
+Part 1 measures how depth changes the KEEP co-occurrence matrix, i.e. the
+relationships KEEP's GloVe stage would learn from. Part 2 measures how depth
+changes the information in a patient's diagnosis features for an applied
+prediction task. **The predictor never uses the co-occurrence matrix**: it
+receives rolled-up diagnosis tokens directly, so it says nothing about the
+KEEP embedding itself.
 
 Experimental setup
 ------------------
@@ -56,7 +82,10 @@ fits its code vocabulary on that seed's training patients only and reuses it
 for validation and test (unseen codes map to ``<unk>``), then trains
 ``pyhealth.models.LogisticRegression`` with ``Trainer`` (Adam, model
 selection on validation ROC-AUC) and reports test ROC-AUC and PR-AUC, mean
-and standard deviation over seeds, plus each seed's score. Before any
+and standard deviation over seeds, plus each seed's score. ``vocabulary``
+counts the distinct tokens in an arm; ``train_vocabulary`` is the fitted
+vocabulary size (training patients' tokens plus ``<pad>`` and ``<unk>``),
+averaged over seeds. Before any
 training, each seed's folds must give train, validation and test both labels;
 otherwise the run stops with the per-part counts instead of producing NaN
 scores. Non-finite scores also stop the run rather than being averaged or
@@ -79,7 +108,9 @@ The synthetic cohort has a planted rule: next-admission death depends on one
 ICD-9 code. In the synthetic vocabulary its concept and two other codes'
 concepts share an ancestor at depth 5, so depths 3 to 5 merge them and only
 depth 6, ``uncut`` and raw ``icd`` keep the risk code apart. Their AUROC
-should be clearly higher. This checks the pipeline, not a clinical finding.
+should be clearly higher. This checks the pipeline, not a clinical finding,
+and synthetic checks only establish how our reproduction behaves, not the
+original authors' implementation.
 
 Real data (run locally; prints and saves aggregate counts only)::
 
@@ -135,6 +166,7 @@ from pyhealth.datasets import MIMIC4Dataset, get_dataloader
 from pyhealth.medcode import OMOPVocabulary
 from pyhealth.models import LogisticRegression
 from pyhealth.tasks import KeepConditionHistoryTask, build_keep_omop_ancestor_rollup
+from pyhealth.tasks.keep import PRESENCE_THRESHOLD
 from pyhealth.trainer import Trainer
 
 #: Depth used for the "uncut" arm: deeper than any SNOMED Disease concept.
@@ -491,14 +523,29 @@ def main(argv=None) -> Dict[str, Any]:
         hidden = ("mimic", "athena", "cache", "out")  # local paths stay out
         config = {k: v for k, v in vars(args).items() if k not in hidden}
         config.update(release=release, synthetic=not args.mimic)
-        output: Dict[str, Any] = {"config": config}
+        output: Dict[str, Any] = {
+            "config": config,
+            "reference": {
+                "max_depth": args.reference,
+                "target_policy": args.policy,
+                "path_source": args.path_source,
+                "include_root": False,
+                "on_unmapped": "empty",
+                "presence_threshold": PRESENCE_THRESHOLD,
+                "vocabulary_release": release,
+                "cohort": "same patients and diagnosis histories for every depth",
+            },
+        }
         if not args.skip_matrix:
             output["cooccurrence"] = run_matrix_ablation(
                 dataset, vocabulary, release, processors, depths, args
             )
             print_table(
                 "KEEP co-occurrence by depth",
-                {f"depth {d}": s for d, s in output["cooccurrence"].items()},
+                {
+                    f"depth {d}" + (" (ref)" if d == args.reference else ""): s
+                    for d, s in output["cooccurrence"].items()
+                },
             )
         if not args.skip_model:
             output["mortality"], output["folds"] = run_model_ablation(
