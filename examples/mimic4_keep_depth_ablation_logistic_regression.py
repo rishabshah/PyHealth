@@ -111,12 +111,14 @@ import torch
 from examples.keep_depth_ablation_utils import (
     DEPTHS,
     REFERENCE_DEPTH,
-    ConceptFeaturizer,
-    ConditionMortalityMIMIC4,
     RollupRecorder,
-    featurize_arms,
     matrix_summary,
     shared_concept_comparison,
+)
+from examples.keep_depth_mortality_utils import (
+    ConceptFeaturizer,
+    ConditionMortalityMIMIC4,
+    featurize_arms,
 )
 from pyhealth.datasets import (
     MIMIC4Dataset,
