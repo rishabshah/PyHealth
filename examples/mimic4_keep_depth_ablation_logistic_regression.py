@@ -50,20 +50,55 @@ patient's diagnosis history once; for each depth an
 
 * size: retained ``vocabulary``, ``concepts_observed``, ``patients_with_conditions``
   (patients with a present concept), ``nonzero_pairs`` and ``density``
-  (nonzero pairs / possible pairs among observed concepts);
+  (nonzero pairs / ``possible_pairs_observed``, the pairs among observed
+  concepts); ``possible_pairs_axes`` counts pairs among all retained concepts;
 * roll-up: ``targets_per_diagnosis``, ``multi_target_share`` (diagnoses reaching
   several retained ancestors), ``rolled_up_share`` (mapped concepts that had to
   be rolled up rather than kept as-is);
-* frequency concentration: ``mean_prevalence``, ``prevalence_gini``, and for
-  pair counts ``pair_gini``, ``pair_top1pct_share``, ``pair_hhi`` and
-  ``pair_entropy`` (Shannon entropy / its maximum);
+* concentration, over the nonzero pairs on that depth's own axes:
+  ``mean_prevalence``, ``prevalence_gini``, ``pair_gini``,
+  ``pair_top1pct_share`` and ``pair_hhi``;
+* entropy of the pair-count distribution: raw ``pair_entropy_bits``, and
+  normalized two ways with the denominator in the name,
+  ``pair_entropy_norm_nonzero_pairs`` (log2 of nonzero pairs) and
+  ``pair_entropy_norm_possible_pairs`` (log2 of ``possible_pairs_axes``, the
+  convention #7 uses); the two normalized values are not interchangeable.
+  ``partner_entropy_bits_median`` and ``partner_entropy_norm_median`` summarize
+  each concept's partner distribution (concepts with at least two partners);
 * association: ``mean_pmi``, ``positive_pmi_share``, ``mean_ppmi``,
   ``mean_npmi`` over observed pairs (PMI = log(N n_ij / n_i n_j)).
 
-Because each depth has its own vocabulary, it is also compared with depth 5
-on the concepts every depth retains: ``ppmi_spearman`` (rank agreement of PPMI
-over their pairs), ``mean_profile_jsd`` (base-2 Jensen-Shannon divergence of
-each concept's partner distribution) and ``median_prevalence_ratio``.
+Each depth has its own vocabulary, so the second table compares each depth
+with the reference on **common retained axes**: the concepts every depth
+retains (depth <= 3 when depth 3 is included), aligned by concept ID, same
+patients, diagonal excluded from partner profiles. A mapped common vocabulary
+would not add information here: under ``first_retained``, rolling each
+depth's targets up to the shallowest depth reproduces that depth's matrix.
+Reported:
+
+* coverage: ``axes_shared``, ``concepts_in_both``, ``concepts_only_here`` /
+  ``concepts_only_reference``, and what the axes exclude from this depth
+  (``excluded_concepts``, ``excluded_pair_mass_share``); pairs
+  ``pairs_matched``, ``pairs_gained`` and ``pairs_lost``;
+* magnitude: ``prevalence_abs_change_sum``, ``prevalence_change_median`` and
+  ``median_prevalence_ratio`` on aligned concepts; ``count_abs_change_sum``
+  and ``count_changed_pairs`` on aligned pairs;
+* partner profiles, for both counts and PPMI: base-2 JSD (``*_jsd_mean``,
+  ``*_jsd_median``, ``*_jsd_p90``; lower = closer to the reference) and
+  cosine (``*_cosine_mean``, ``*_cosine_median``, ``*_cosine_p10``), with
+  ``*_profile_rows_valid`` and ``*_profile_rows_undefined`` (a concept whose
+  profile is empty in either matrix is undefined, not scored);
+* association on matched pairs: ``ppmi_spearman`` (over pairs in either),
+  ``ppmi_change_median``, ``ppmi_abs_change_mean``, ``npmi_change_median``,
+  ``npmi_abs_change_mean`` and ``npmi_undefined_matched_pairs``; new and lost
+  associations are ``pairs_gained`` and ``pairs_lost``;
+* conditional probability: ``conditional_prob_abs_change_median`` and
+  ``_mean`` of |P(B|A) change| over both directions of each matched pair.
+
+Under ``first_retained`` a retained concept gains counts only as the nearest
+retained ancestor, so on these axes depths 4 to 6 can be identical by
+construction; their differences then show in the per-depth table. Higher
+cosine or entropy does not by itself mean clinically better.
 
 Part 2, downstream performance (the rubric's "existing PyHealth model").
 ``ConditionMortalityMIMIC4`` makes one sample per adult admission that has a
@@ -150,8 +185,9 @@ from examples.keep_depth_ablation_utils import (
     DEPTHS,
     REFERENCE_DEPTH,
     RollupRecorder,
+    aligned_comparison,
+    common_axes,
     matrix_summary,
-    shared_concept_comparison,
 )
 from examples.keep_depth_mortality_utils import (
     ConceptFeaturizer,
@@ -321,18 +357,12 @@ def run_matrix_ablation(dataset, vocabulary, release, processors, depths, args):
         )
         results[depth] = result
         summaries[depth] = matrix_summary(result, recorder)
-    shared = sorted(set.intersection(*(set(r.concept_ids) for r in results.values())))
+    shared = common_axes(results.values())
     reference = results[args.reference]
-    for depth in depths:
-        summaries[depth].update(
-            {
-                f"vs_depth{args.reference}_{key}": value
-                for key, value in shared_concept_comparison(
-                    results[depth], reference, shared
-                ).items()
-            }
-        )
-    return summaries
+    aligned = {
+        depth: aligned_comparison(results[depth], reference, shared) for depth in depths
+    }
+    return summaries, aligned
 
 
 def _scores(train, val, test, seed, args) -> Dict[str, float]:
@@ -537,15 +567,22 @@ def main(argv=None) -> Dict[str, Any]:
             },
         }
         if not args.skip_matrix:
-            output["cooccurrence"] = run_matrix_ablation(
-                dataset, vocabulary, release, processors, depths, args
+            output["cooccurrence"], output["aligned_vs_reference"] = (
+                run_matrix_ablation(
+                    dataset, vocabulary, release, processors, depths, args
+                )
+            )
+
+            def label(depth):
+                return f"depth {depth}" + (" (ref)" if depth == args.reference else "")
+
+            print_table(
+                "KEEP co-occurrence by depth (each depth's own axes)",
+                {label(d): s for d, s in output["cooccurrence"].items()},
             )
             print_table(
-                "KEEP co-occurrence by depth",
-                {
-                    f"depth {d}" + (" (ref)" if d == args.reference else ""): s
-                    for d, s in output["cooccurrence"].items()
-                },
+                f"Aligned with depth {args.reference} on common retained axes",
+                {label(d): s for d, s in output["aligned_vs_reference"].items()},
             )
         if not args.skip_model:
             output["mortality"], output["folds"] = run_model_ablation(

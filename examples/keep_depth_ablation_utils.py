@@ -11,7 +11,7 @@ so the ablation reports two kinds of evidence:
 
 * Co-occurrence statistics for each depth's KEEP matrix
   (:func:`matrix_summary`), plus a comparison with the reference depth on the
-  concepts every depth shares (:func:`shared_concept_comparison`).
+  concepts every depth retains (:func:`aligned_comparison`).
 * Downstream performance, kept separately in
   ``examples/keep_depth_mortality_utils.py``: the same patients, labels and
   PyHealth model, with diagnosis codes rolled up to each depth.
@@ -210,10 +210,63 @@ def pair_pmi(
     return pmi, npmi
 
 
+def entropy_bits(values: Sequence[float]) -> Optional[float]:
+    """Shannon entropy, in bits, of the distribution proportional to ``values``.
+
+    Example:
+        >>> entropy_bits([1, 1, 1, 1])
+        2.0
+    """
+    data = np.asarray(values, dtype=float)
+    data = data[data > 0]
+    if data.size == 0:
+        return None
+    p = data / data.sum()
+    return float(-np.sum(p * np.log2(p)))
+
+
+def _normalized(entropy: Optional[float], support: int) -> Optional[float]:
+    """Entropy divided by its maximum, log2(support); None if undefined."""
+    if entropy is None or support < 2:
+        return None
+    return entropy / math.log2(support)
+
+
+def _quantile(values: np.ndarray, q: float) -> Optional[float]:
+    return float(np.quantile(values, q)) if values.size else None
+
+
+def partner_entropies(
+    size: int, i: np.ndarray, j: np.ndarray, counts: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Entropy (bits) of each concept's partner distribution, diagonal excluded.
+
+    Returns:
+        ``(raw, normalized)`` for concepts with at least two partners;
+        ``normalized`` divides by log2(number of partners).
+    """
+    rows = np.concatenate([i, j])
+    weights = np.concatenate([counts, counts]).astype(float)
+    mass = np.bincount(rows, weights=weights, minlength=size)
+    partners = np.bincount(rows, minlength=size)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p = weights / mass[rows]
+        terms = np.where(p > 0, -p * np.log2(p), 0.0)
+    raw = np.bincount(rows, weights=terms, minlength=size)
+    keep = partners >= 2
+    return raw[keep], raw[keep] / np.log2(partners[keep])
+
+
 def matrix_summary(
     result: Any, recorder: Optional[RollupRecorder] = None
 ) -> Dict[str, Any]:
     """Size, density, concentration and association statistics for one matrix.
+
+    Pair-level measures are computed over the **nonzero pairs on this depth's
+    own axes** (diagonal excluded). Their denominators are explicit:
+    ``possible_pairs_observed`` (pairs among observed concepts, the density
+    denominator) and ``possible_pairs_axes`` (pairs among all retained
+    concepts, the universe #7 uses to normalize entropy).
 
     Args:
         result: A ``KeepCooccurrenceResult``.
@@ -225,24 +278,34 @@ def matrix_summary(
     """
     prevalence, i, j, counts = matrix_arrays(result.matrix)
     patients = result.patients_processed
+    axes = len(result.concept_ids)
     observed = int(np.count_nonzero(prevalence))
-    possible = observed * (observed - 1) // 2
+    possible_observed = observed * (observed - 1) // 2
+    possible_axes = axes * (axes - 1) // 2
+    bits = entropy_bits(counts)
+    raw_partner, norm_partner = partner_entropies(axes, i, j, counts)
     summary: Dict[str, Any] = {
-        "vocabulary": len(result.concept_ids),
+        "vocabulary": axes,
         "concepts_observed": observed,
         "patients": patients,
         "patients_with_conditions": result.patients_with_present_targets,
         "diagnoses": result.unique_diagnosis_events,
         "diagnoses_mapped": result.mapped_events,
         "nonzero_pairs": int(counts.size),
-        "density": counts.size / possible if possible else None,
+        "possible_pairs_observed": possible_observed,
+        "possible_pairs_axes": possible_axes,
+        "density": counts.size / possible_observed if possible_observed else None,
         "pair_mass": int(counts.sum()),
         "mean_prevalence": _mean(prevalence[prevalence > 0].astype(float)),
         "prevalence_gini": gini(prevalence[prevalence > 0]),
         "pair_gini": gini(counts),
         "pair_top1pct_share": top_share(counts),
         "pair_hhi": hhi(counts),
-        "pair_entropy": normalized_entropy(counts),
+        "pair_entropy_bits": bits,
+        "pair_entropy_norm_nonzero_pairs": _normalized(bits, int(counts.size)),
+        "pair_entropy_norm_possible_pairs": _normalized(bits, possible_axes),
+        "partner_entropy_bits_median": _quantile(raw_partner, 0.5),
+        "partner_entropy_norm_median": _quantile(norm_partner, 0.5),
     }
     if counts.size and patients:
         pmi, npmi = pair_pmi(i, j, counts, prevalence, patients)
@@ -261,6 +324,12 @@ def matrix_summary(
     return summary
 
 
+def common_axes(results: Iterable[Any]) -> list:
+    """Concept ids retained at every depth: the aligned comparison's axes."""
+    sets = [set(result.concept_ids) for result in results]
+    return sorted(set.intersection(*sets)) if sets else []
+
+
 def _restricted(result: Any, shared: Sequence[str]):
     """Prevalence and pairs of ``result`` on the ``shared`` concepts only."""
     index = {code: k for k, code in enumerate(shared)}
@@ -271,97 +340,170 @@ def _restricted(result: Any, shared: Sequence[str]):
     shared_prevalence[remap[keep_axis]] = prevalence[keep_axis]
     a, b = remap[i], remap[j]
     keep = (a >= 0) & (b >= 0)
+    excluded_mass = counts[~keep].sum()
+    total_mass = counts.sum()
+    excluded_concepts = int(np.count_nonzero(prevalence[~keep_axis]))
     a, b, counts = a[keep], b[keep], counts[keep]
     low, high = np.minimum(a, b), np.maximum(a, b)
-    return shared_prevalence, low, high, counts
+    coverage = {
+        "excluded_concepts": excluded_concepts,
+        "excluded_pair_mass_share": (
+            float(excluded_mass / total_mass) if total_mass else None
+        ),
+    }
+    return shared_prevalence, low, high, counts, coverage
 
 
-def _jsd_by_row(rows_p, cols_p, p_vals, rows_q, cols_q, q_vals, size):
-    """Base-2 Jensen-Shannon divergence between matching sparse rows."""
-    width = size
-    keys_p = rows_p * width + cols_p
-    keys_q = rows_q * width + cols_q
-    keys = np.union1d(keys_p, keys_q)
-    p = np.zeros(keys.size)
-    q = np.zeros(keys.size)
-    p[np.searchsorted(keys, keys_p)] = p_vals
-    q[np.searchsorted(keys, keys_q)] = q_vals
-    rows = keys // width
-    mass_p = np.bincount(rows, weights=p, minlength=size)
-    mass_q = np.bincount(rows, weights=q, minlength=size)
-    valid = (mass_p > 0) & (mass_q > 0)
+def _row_similarity(rows, left, right, size, eligible):
+    """Base-2 JSD and cosine between each concept's two partner profiles.
+
+    Rows that are empty in either profile are undefined.
+    """
+    mass_l = np.bincount(rows, weights=left, minlength=size)
+    mass_r = np.bincount(rows, weights=right, minlength=size)
+    valid = eligible & (mass_l > 0) & (mass_r > 0)
     with np.errstate(divide="ignore", invalid="ignore"):
-        p = p / mass_p[rows]
-        q = q / mass_q[rows]
+        p, q = left / mass_l[rows], right / mass_r[rows]
         m = (p + q) / 2
-        terms = np.where(p > 0, p * np.log2(p / m), 0) + np.where(
-            q > 0, q * np.log2(q / m), 0
+        terms = np.where(p > 0, p * np.log2(p / m), 0.0) + np.where(
+            q > 0, q * np.log2(q / m), 0.0
         )
-    divergence = np.bincount(rows, weights=terms / 2, minlength=size)
-    return divergence[valid]
+        jsd = np.bincount(rows, weights=terms / 2, minlength=size)
+        dot = np.bincount(rows, weights=left * right, minlength=size)
+        norm_l = np.sqrt(np.bincount(rows, weights=left**2, minlength=size))
+        norm_r = np.sqrt(np.bincount(rows, weights=right**2, minlength=size))
+        cosine = dot / (norm_l * norm_r)
+    jsd = np.clip(jsd[valid], 0.0, 1.0)
+    cosine = np.clip(cosine[valid], 0.0, 1.0)
+    return jsd, cosine, int(valid.sum()), int((eligible & ~valid).sum())
 
 
-def shared_concept_comparison(
+def aligned_comparison(
     result: Any, reference: Any, shared: Sequence[str]
 ) -> Dict[str, Any]:
-    """Compares a matrix with the reference matrix on concepts both keep.
+    """Compares a matrix with the reference matrix on common retained axes.
 
-    Only concepts retained at every depth (and seen in both cohorts) are
-    compared, so differences come from how deeper codes were rolled up, not
-    from the vocabularies being different.
+    Both matrices are restricted to ``shared`` (concepts retained at every
+    depth), aligned by concept ID, with the diagonal excluded from partner
+    profiles. Both come from the same patients, so differences come from how
+    codes were rolled up. Concepts and pairs outside ``shared`` are excluded,
+    and how much of this matrix that leaves out is reported.
+
+    Profile measures cover concepts observed in either matrix; a concept
+    whose count (or PPMI) partner profile is empty in either matrix is
+    counted as undefined rather than scored. JSD is the base-2 divergence in
+    [0, 1] (not its square root); lower means closer to the reference.
+    Higher cosine or entropy does not by itself mean clinically better.
 
     Args:
         result: The ``KeepCooccurrenceResult`` being compared.
         reference: The reference depth's ``KeepCooccurrenceResult``.
-        shared: Concept ids retained at every depth.
+        shared: Concept ids retained at every depth (:func:`common_axes`).
 
     Returns:
-        ``shared_concepts`` (seen in both), ``ppmi_spearman`` (rank
-        correlation of PPMI over pairs seen in either), ``mean_profile_jsd``
-        (base-2 Jensen-Shannon divergence of each concept's partner
-        distribution, averaged) and ``median_prevalence_ratio``.
+        A flat dictionary of coverage, magnitude, profile, association and
+        conditional-probability changes; keys are listed in the example
+        script's docstring.
     """
-    prev_a, ia, ja, ca = _restricted(result, shared)
-    prev_b, ib, jb, cb = _restricted(reference, shared)
-    both = (prev_a > 0) & (prev_b > 0)
-    out: Dict[str, Any] = {
-        "shared_concepts": int(both.sum()),
-        "median_prevalence_ratio": (
-            float(np.median(prev_a[both] / prev_b[both])) if both.any() else None
-        ),
-        "ppmi_spearman": None,
-        "mean_profile_jsd": None,
-    }
+    if result.patients_processed != reference.patients_processed:
+        raise ValueError("aligned comparison needs the same patients")
+    n = result.patients_processed
+    prev_a, ia, ja, ca, coverage = _restricted(result, shared)
+    prev_b, ib, jb, cb, _ = _restricted(reference, shared)
     size = len(shared)
-    in_a = both[ia] & both[ja]
-    in_b = both[ib] & both[jb]
-    ia, ja, ca = ia[in_a], ja[in_a], ca[in_a]
-    ib, jb, cb = ib[in_b], jb[in_b], cb[in_b]
-
-    def ppmi(i, j, c, prev, n):
-        return np.maximum(np.log(n * c / (prev[i].astype(float) * prev[j])), 0)
+    in_a, in_b = prev_a > 0, prev_b > 0
+    both = in_a & in_b
 
     keys_a, keys_b = ia * size + ja, ib * size + jb
     keys = np.union1d(keys_a, keys_b)
-    if keys.size >= 3:
-        va, vb = np.zeros(keys.size), np.zeros(keys.size)
-        va[np.searchsorted(keys, keys_a)] = ppmi(
-            ia, ja, ca, prev_a, result.patients_processed
+    count_a, count_b = np.zeros(keys.size), np.zeros(keys.size)
+    count_a[np.searchsorted(keys, keys_a)] = ca
+    count_b[np.searchsorted(keys, keys_b)] = cb
+    low, high = keys // size, keys % size
+    matched = (count_a > 0) & (count_b > 0)
+
+    def ppmi_npmi(counts, prev):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pmi = np.log(n * counts / (prev[low].astype(float) * prev[high]))
+            npmi = pmi / -np.log(counts / n)
+        defined = counts > 0
+        ppmi = np.where(defined, np.maximum(pmi, 0.0), 0.0)
+        npmi = np.where(defined & np.isfinite(npmi), npmi, np.nan)
+        return ppmi, npmi
+
+    ppmi_a, npmi_a = ppmi_npmi(count_a, prev_a)
+    ppmi_b, npmi_b = ppmi_npmi(count_b, prev_b)
+
+    out: Dict[str, Any] = {
+        "axes_shared": size,
+        "concepts_in_both": int(both.sum()),
+        "concepts_only_here": int((in_a & ~in_b).sum()),
+        "concepts_only_reference": int((in_b & ~in_a).sum()),
+        **coverage,
+        "pairs_matched": int(matched.sum()),
+        "pairs_gained": int(((count_a > 0) & (count_b == 0)).sum()),
+        "pairs_lost": int(((count_b > 0) & (count_a == 0)).sum()),
+        "prevalence_abs_change_sum": int(np.abs(prev_a - prev_b).sum()),
+        "prevalence_change_median": _quantile((prev_a - prev_b)[both], 0.5),
+        "median_prevalence_ratio": (
+            _quantile(prev_a[both] / prev_b[both], 0.5) if both.any() else None
+        ),
+        "count_abs_change_sum": int(np.abs(count_a - count_b).sum()),
+        "count_changed_pairs": int((count_a != count_b).sum()),
+    }
+
+    rows = np.concatenate([low, high])
+    eligible = in_a | in_b
+    for name, left, right in (
+        ("count", count_a, count_b),
+        ("ppmi", ppmi_a, ppmi_b),
+    ):
+        jsd, cosine, valid, undefined = _row_similarity(
+            rows,
+            np.concatenate([left, left]),
+            np.concatenate([right, right]),
+            size,
+            eligible,
         )
-        vb[np.searchsorted(keys, keys_b)] = ppmi(
-            ib, jb, cb, prev_b, reference.patients_processed
+        out.update(
+            {
+                f"{name}_profile_rows_valid": valid,
+                f"{name}_profile_rows_undefined": undefined,
+                f"{name}_jsd_mean": _mean(jsd),
+                f"{name}_jsd_median": _quantile(jsd, 0.5),
+                f"{name}_jsd_p90": _quantile(jsd, 0.9),
+                f"{name}_cosine_mean": _mean(cosine),
+                f"{name}_cosine_median": _quantile(cosine, 0.5),
+                f"{name}_cosine_p10": _quantile(cosine, 0.1),
+            }
         )
-        if np.ptp(va) > 0 and np.ptp(vb) > 0:
-            out["ppmi_spearman"] = float(spearmanr(va, vb).statistic)
-    divergence = _jsd_by_row(
-        np.concatenate([ia, ja]),
-        np.concatenate([ja, ia]),
-        np.concatenate([ca, ca]),
-        np.concatenate([ib, jb]),
-        np.concatenate([jb, ib]),
-        np.concatenate([cb, cb]),
-        size,
+
+    ppmi_change = (ppmi_a - ppmi_b)[matched]
+    npmi_ok = matched & np.isfinite(npmi_a) & np.isfinite(npmi_b)
+    npmi_change = (npmi_a - npmi_b)[npmi_ok]
+    out.update(
+        {
+            "ppmi_spearman": None,
+            "ppmi_change_median": _quantile(ppmi_change, 0.5),
+            "ppmi_abs_change_mean": _mean(np.abs(ppmi_change)),
+            "npmi_change_median": _quantile(npmi_change, 0.5),
+            "npmi_abs_change_mean": _mean(np.abs(npmi_change)),
+            "npmi_undefined_matched_pairs": int((matched & ~npmi_ok).sum()),
+        }
     )
-    if divergence.size:
-        out["mean_profile_jsd"] = float(divergence.mean())
+    if keys.size >= 3 and np.ptp(ppmi_a) > 0 and np.ptp(ppmi_b) > 0:
+        out["ppmi_spearman"] = float(spearmanr(ppmi_a, ppmi_b).statistic)
+
+    # P(B | A) = n_AB / n_A, both directions of every matched pair
+    pa, pb = prev_a.astype(float), prev_b.astype(float)
+    lo, hi = low[matched], high[matched]
+    cond_a = np.concatenate([count_a[matched] / pa[lo], count_a[matched] / pa[hi]])
+    cond_b = np.concatenate([count_b[matched] / pb[lo], count_b[matched] / pb[hi]])
+    cond_change = np.abs(cond_a - cond_b)
+    out.update(
+        {
+            "conditional_prob_abs_change_median": _quantile(cond_change, 0.5),
+            "conditional_prob_abs_change_mean": _mean(cond_change),
+        }
+    )
     return out

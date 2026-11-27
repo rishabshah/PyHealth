@@ -14,12 +14,14 @@ import torch
 
 from examples.keep_depth_ablation_utils import (
     RollupRecorder,
+    aligned_comparison,
+    common_axes,
+    entropy_bits,
     gini,
     hhi,
     matrix_arrays,
     matrix_summary,
     normalized_entropy,
-    shared_concept_comparison,
     top_share,
 )
 
@@ -98,41 +100,164 @@ class TestMatrixSummary(unittest.TestCase):
         self.assertIsNone(s["mean_ppmi"])
 
 
-class TestSharedConceptComparison(unittest.TestCase):
+def _jsd_reference(left, right):
+    """Independent base-2 JSD between two dict profiles (as in #7's helper)."""
+    a, b = sum(left.values()), sum(right.values())
+    total = 0.0
+    for key in left.keys() | right.keys():
+        p, q = left.get(key, 0) / a, right.get(key, 0) / b
+        m = (p + q) / 2
+        total += (
+            (p * math.log2(p / m) if p else 0) + (q * math.log2(q / m) if q else 0)
+        ) / 2
+    return total
+
+
+def _cosine_reference(left, right):
+    dot = sum(v * right.get(k, 0) for k, v in left.items())
+    norm = math.sqrt(sum(v * v for v in left.values())) * math.sqrt(
+        sum(v * v for v in right.values())
+    )
+    return dot / norm
+
+
+def _profiles(pairs, shared):
+    """Count partner profiles on the shared axes, diagonal excluded."""
+    out = {c: {} for c in shared}
+    for (a, b), count in pairs.items():
+        if a in out and b in out and count:
+            out[a][b] = count
+            out[b][a] = count
+    return out
+
+
+class TestAlignedComparison(unittest.TestCase):
     def setUp(self):
+        self.shared = ["A", "B", "C", "D"]
         self.prevalence = {"A": 6, "B": 5, "C": 4, "D": 3}
         self.pairs = {("A", "B"): 3, ("A", "C"): 1, ("B", "C"): 2, ("C", "D"): 2}
-        self.reference = _result(["A", "B", "C", "D"], self.prevalence, self.pairs, 10)
-
-    def test_identical_matrices(self):
-        out = shared_concept_comparison(
-            self.reference, self.reference, ["A", "B", "C", "D"]
+        # the reference also keeps X, which the other depth does not
+        self.reference = _result(
+            ["X", "A", "B", "C", "D"], {**self.prevalence, "X": 2}, self.pairs, 10
         )
-        self.assertEqual(out["shared_concepts"], 4)
-        self.assertAlmostEqual(out["ppmi_spearman"], 1.0)
-        self.assertAlmostEqual(out["mean_profile_jsd"], 0.0)
-        self.assertAlmostEqual(out["median_prevalence_ratio"], 1.0)
-
-    def test_extra_concepts_are_ignored_and_shifts_are_measured(self):
-        # a shallower depth: an extra concept X, doubled prevalence, and
-        # C's partner mass moved from B to D
-        shallow = _result(
-            ["X", "A", "B", "C", "D"],
-            {"X": 9, **{k: 2 * v for k, v in self.prevalence.items()}},
-            {("X", "A"): 5, ("A", "B"): 3, ("A", "C"): 1, ("B", "C"): 1, ("C", "D"): 6},
+        # another depth: keeps Y instead of X, A more prevalent, D rarer;
+        # A-D gained, B-C and C-D lost, A-Y and B-Y outside the shared axes
+        self.here_pairs = {
+            ("A", "B"): 4,
+            ("A", "C"): 1,
+            ("A", "D"): 1,
+            ("A", "Y"): 3,
+            ("B", "Y"): 2,
+        }
+        self.here = _result(
+            ["A", "B", "C", "D", "Y"],
+            {"A": 8, "B": 5, "C": 4, "D": 2, "Y": 5},
+            self.here_pairs,
             10,
         )
-        out = shared_concept_comparison(shallow, self.reference, ["A", "B", "C", "D"])
-        self.assertEqual(out["shared_concepts"], 4)
-        self.assertAlmostEqual(out["median_prevalence_ratio"], 2.0)
-        self.assertGreater(out["mean_profile_jsd"], 0.0)
-        self.assertLessEqual(out["mean_profile_jsd"], 1.0)
 
-    def test_unseen_concepts_are_not_compared(self):
+    def test_common_axes(self):
+        self.assertEqual(common_axes([self.here, self.reference]), self.shared)
+
+    def test_identical_matrices(self):
+        out = aligned_comparison(self.reference, self.reference, self.shared)
+        self.assertEqual(out["concepts_in_both"], 4)
+        self.assertEqual((out["pairs_gained"], out["pairs_lost"]), (0, 0))
+        self.assertEqual(out["count_abs_change_sum"], 0)
+        self.assertAlmostEqual(out["ppmi_spearman"], 1.0)
+        self.assertAlmostEqual(out["count_jsd_mean"], 0.0)
+        self.assertAlmostEqual(out["count_cosine_mean"], 1.0)
+        self.assertAlmostEqual(out["median_prevalence_ratio"], 1.0)
+        self.assertEqual(out["excluded_concepts"], 1)  # X has no partners
+        self.assertEqual(out["excluded_pair_mass_share"], 0.0)
+
+    def test_coverage_and_magnitude(self):
+        out = aligned_comparison(self.here, self.reference, self.shared)
+        self.assertEqual(out["axes_shared"], 4)
+        self.assertEqual(out["concepts_in_both"], 4)
+        self.assertEqual(out["concepts_only_here"], 0)
+        self.assertEqual(out["excluded_concepts"], 1)  # Y
+        self.assertAlmostEqual(out["excluded_pair_mass_share"], 5 / 11)
+        self.assertEqual(out["pairs_matched"], 2)  # A-B, A-C
+        self.assertEqual(out["pairs_gained"], 1)  # A-D
+        self.assertEqual(out["pairs_lost"], 2)  # B-C, C-D
+        self.assertEqual(out["prevalence_abs_change_sum"], 3)  # |8-6| + |2-3|
+        self.assertEqual(out["prevalence_change_median"], 0.0)
+        self.assertAlmostEqual(out["median_prevalence_ratio"], 1.0)
+        self.assertEqual(out["count_abs_change_sum"], 6)  # 1 + 1 + 2 + 2
+        self.assertEqual(out["count_changed_pairs"], 4)
+
+    def test_profiles_match_an_independent_calculation(self):
+        out = aligned_comparison(self.here, self.reference, self.shared)
+        here = _profiles(self.here_pairs, self.shared)
+        ref = _profiles(self.pairs, self.shared)
+        jsd = sorted(_jsd_reference(here[c], ref[c]) for c in self.shared)
+        cos = sorted(_cosine_reference(here[c], ref[c]) for c in self.shared)
+        self.assertEqual(out["count_profile_rows_valid"], 4)
+        self.assertEqual(out["count_profile_rows_undefined"], 0)
+        self.assertAlmostEqual(out["count_jsd_mean"], sum(jsd) / 4)
+        self.assertAlmostEqual(out["count_jsd_median"], (jsd[1] + jsd[2]) / 2)
+        self.assertAlmostEqual(out["count_cosine_mean"], sum(cos) / 4)
+        # every PPMI here is 0, so every PPMI row is empty: undefined, not 0
+        self.assertEqual(out["ppmi_profile_rows_valid"], 0)
+        self.assertEqual(out["ppmi_profile_rows_undefined"], 4)
+        self.assertIsNone(out["ppmi_jsd_mean"])
+        self.assertIsNone(out["ppmi_spearman"])
+
+    def test_association_and_conditional_probability(self):
+        out = aligned_comparison(self.here, self.reference, self.shared)
+        # matched pairs: A-B has PPMI 0 in both; A-C has negative PMI in both
+        self.assertEqual(out["ppmi_change_median"], 0.0)
+        npmi_ac = math.log(10 / 32) / -math.log(0.1) - math.log(10 / 24) / -math.log(
+            0.1
+        )
+        self.assertAlmostEqual(out["npmi_change_median"], npmi_ac / 2)
+        self.assertAlmostEqual(out["npmi_abs_change_mean"], abs(npmi_ac) / 2)
+        self.assertEqual(out["npmi_undefined_matched_pairs"], 0)
+        # |P(B|A) change| both ways: A-B 4/8 vs 3/6, 4/5 vs 3/5; A-C 1/8 vs 1/6, 1/4
+        changes = sorted([0.0, 0.2, 1 / 6 - 1 / 8, 0.0])
+        self.assertAlmostEqual(
+            out["conditional_prob_abs_change_median"], (changes[1] + changes[2]) / 2
+        )
+        self.assertAlmostEqual(
+            out["conditional_prob_abs_change_mean"], sum(changes) / 4
+        )
+
+    def test_unseen_concepts_are_counted_not_scored(self):
         partial = _result(["A", "B", "C", "D"], {"A": 6, "B": 5}, {("A", "B"): 3}, 10)
-        out = shared_concept_comparison(partial, self.reference, ["A", "B", "C", "D"])
-        self.assertEqual(out["shared_concepts"], 2)
-        self.assertIsNone(out["ppmi_spearman"])  # one pair cannot be ranked
+        out = aligned_comparison(partial, self.reference, self.shared)
+        self.assertEqual(out["concepts_in_both"], 2)
+        self.assertEqual(out["concepts_only_reference"], 2)
+        self.assertEqual(out["count_profile_rows_valid"], 2)  # A, B
+        self.assertEqual(out["count_profile_rows_undefined"], 2)  # C, D empty here
+        self.assertIsNone(out["ppmi_spearman"])  # PPMI is 0 everywhere here
+
+    def test_needs_same_patients(self):
+        other = _result(["A", "B"], {"A": 1}, {}, 11)
+        with self.assertRaises(ValueError):
+            aligned_comparison(other, self.reference, self.shared)
+
+
+class TestEntropyDenominators(unittest.TestCase):
+    def test_raw_and_both_normalizations(self):
+        # pairs A-B 1, A-C 1, A-D 2 on 4 axes: H = 1.5 bits
+        result = _result(
+            ["A", "B", "C", "D"],
+            {"A": 4, "B": 1, "C": 1, "D": 2},
+            {("A", "B"): 1, ("A", "C"): 1, ("A", "D"): 2},
+            10,
+        )
+        s = matrix_summary(result)
+        self.assertAlmostEqual(entropy_bits([1, 1, 2]), 1.5)
+        self.assertAlmostEqual(s["pair_entropy_bits"], 1.5)
+        self.assertAlmostEqual(s["pair_entropy_norm_nonzero_pairs"], 1.5 / math.log2(3))
+        self.assertEqual(s["possible_pairs_axes"], 6)
+        self.assertAlmostEqual(
+            s["pair_entropy_norm_possible_pairs"], 1.5 / math.log2(6)
+        )
+        # only A has two or more partners: B 1, C 1, D 2 -> 1.5 bits
+        self.assertAlmostEqual(s["partner_entropy_bits_median"], 1.5)
+        self.assertAlmostEqual(s["partner_entropy_norm_median"], 1.5 / math.log2(3))
 
 
 class FakeProcessor:
