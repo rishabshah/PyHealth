@@ -2,7 +2,8 @@ Metrics
 ===============
 
 We provide easy to use metrics (the same style and args as `sklearn.metrics`) for binary classification,
-multiclass classification, multilabel classification, and segmentation (Dice/IoU).
+multiclass classification, multilabel classification, segmentation (Dice/IoU)
+and object detection (COCO box AP).
 For applicable tasks, we provide the relevant metrics for model calibration, as well as those for prediction set evaluation.
 Among these we also provide metrics related to uncertainty quantification, for model calibration, as well as metrics that measure the quality of prediction sets
 We also provide other metrics specically for healthcare
@@ -24,11 +25,14 @@ reference includes the ECE definition and formula used by these helpers.
     metrics/pyhealth.metrics.ranking
     metrics/pyhealth.metrics.binary
     metrics/pyhealth.metrics.segmentation
+    metrics/pyhealth.metrics.detection
     metrics/pyhealth.metrics.calibration
     metrics/pyhealth.metrics.bootstrap
     metrics/pyhealth.metrics.clinical
+    metrics/pyhealth.metrics.competing_risks
     metrics/pyhealth.metrics.prediction_set
     metrics/pyhealth.metrics.fairness
     metrics/pyhealth.metrics.interpretability
     metrics/pyhealth.metrics.generative
     metrics/pyhealth.metrics.survival
+    metrics/pyhealth.metrics.survival_curve

@@ -21,7 +21,7 @@ import math
 import os
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import combinations
 from typing import Any
 
@@ -154,8 +154,8 @@ def load_run(
     """Builds the report of a run from its directory alone.
 
     Reads ``trials.jsonl`` and, when present, ``run.json``, ``lessons.json``,
-    ``card.json``, ``attribution.json``, ``explain.json``, ``test.json`` and
-    ``review.json``. Runs written before ``run.json``
+    ``card.json``, ``attribution.json``, ``explain.json``, ``test.json``,
+    ``signal.json`` and ``review.json``. Runs written before ``run.json``
     existed need ``metric`` (and ``maximize`` for a metric where lower is
     better). Their selection is recomputed under the rule the report states,
     and the report says so: the search itself may have chosen another trial.
@@ -215,6 +215,13 @@ def load_run(
         rule=rule, title=title, notes=notes,
         card=read("card.json"), explanation=read("explain.json"),
         review=read("review.json", {}),
+        confirmed={int(k): v for k, v in read("confirm.json", {}).get(
+            "scores", {}).items()},
+        pruning=read("prune.json"),
+        confirm_se=settings.get("confirm_se", 2.0),
+        fold_events=settings.get("fold_events"),
+        min_events=settings.get("min_events_per_fold", 10),
+        signal=read("signal.json"),
     )
 
 
@@ -237,6 +244,12 @@ def build_report(
     card: Any = None,
     explanation: dict[str, Any] | None = None,
     review: dict[str, Any] | None = None,
+    confirmed: dict[int, list[float]] | None = None,
+    pruning: dict[str, Any] | None = None,
+    confirm_se: float = 2.0,
+    fold_events: Sequence[int] | None = None,
+    min_events: int = 10,
+    signal: dict[str, Any] | None = None,
 ) -> Report:
     """Builds a report from a run's trials and, optionally, its test and attribution.
 
@@ -263,6 +276,14 @@ def build_report(
         card: The task's :class:`~pyhealth.tasks.TaskCard` (or its dict).
         explanation: The result of ``AutoImprover.explain``.
         review: Clinician decisions on flags, from ``AutoImprover.approve``.
+        confirmed: Confirmation fold scores by trial id, from
+            ``AutoImprover.confirm``; the selection is then made on them.
+        pruning: The result of ``AutoImprover.prune``.
+        confirm_se: The bound used on the confirmation scores.
+        fold_events: Positive samples in each CV fold, for the ``few_events``
+            flag; ``None`` raises no flag.
+        min_events: The fewest positives per fold without that flag.
+        signal: The comparison with chance, from ``signal.json``.
 
     Examples:
         >>> from pyhealth.autoimprove import Trial
@@ -292,12 +313,36 @@ def build_report(
     # gains are shown against the baseline, or the first trial without one
     reference = baseline or done[0]
     cv = bool(reference.fold_scores) and promote_se is not None
+    pool = [t for t in done if t.accepted is not False]
+    bound = promote_se
+    if confirmed:
+        by_id = {t.trial_id: t for t in pool}
+        pool = [replace(by_id[i], fold_scores=list(v), score=float(sum(v) / len(v)))
+                for i, v in confirmed.items() if i in by_id]
+        bound = max(promote_se or 0.0, confirm_se)
     if cv and one_se:
-        selected, top = select_simplest(done, maximize, promote_se, space.rung)
+        selected, top = select_simplest(pool, maximize, bound, space.rung)
     elif cv:
-        selected = top = select_trial(done, maximize, promote_se)
+        selected = top = select_trial(pool, maximize, bound)
     else:
-        selected = top = max(done, key=lambda t: sign * t.score)
+        selected = top = max(pool, key=lambda t: sign * t.score)
+    chosen = selected  # the rule's pick; pruning may then replace it
+    if confirmed:
+        by_id = {t.trial_id: t for t in done}
+        selected, top = by_id[selected.trial_id], by_id[top.trial_id]
+        chosen = selected
+        pruned = (pruning or {}).get("pruned_trial")
+        if pruned in by_id:
+            selected = by_id[pruned]
+
+    def paired(a_scores, b_scores, a_score, b_score):
+        """Gain of a over b: (mean, se, folds better, n folds)."""
+        if not (a_scores and len(a_scores) == len(b_scores)):
+            return sign * (a_score - b_score), None, None, None
+        gain, se = paired_gain(a_scores, b_scores, maximize)
+        better = sum(sign * (x - y) > FOLD_TIE for x, y in zip(a_scores, b_scores))
+        return gain, se, better, len(a_scores)
+
     notes = list(notes)
     if test and not _same_trial(test.get("best"), selected):
         notes.append(f"The saved test results (test.json) are for "
@@ -312,37 +357,67 @@ def build_report(
         test = {k: v for k, v in test.items() if k not in ("top", "top_minus_best")}
 
     def vs(a, b):
-        """Gain of a over b: (mean, se, folds better, n folds)."""
-        if not (a.fold_scores and len(a.fold_scores) == len(b.fold_scores)):
-            return sign * (a.score - b.score), None, None, None
-        gain, se = paired_gain(a.fold_scores, b.fold_scores, maximize)
-        better = sum(sign * (x - y) > FOLD_TIE
-                     for x, y in zip(a.fold_scores, b.fold_scores))
-        return gain, se, better, len(a.fold_scores)
+        """Gain of a over b on the search folds."""
+        return paired(a.fold_scores, b.fold_scores, a.score, b.score)
+
+    def vs_rule(a, b):
+        """Gain of a over b on the scores the selection used: confirmation
+        scores when both were confirmed, else the search folds."""
+        if confirmed and a.trial_id in confirmed and b.trial_id in confirmed:
+            ca, cb = confirmed[a.trial_id], confirmed[b.trial_id]
+            return paired(ca, cb, sum(ca) / len(ca), sum(cb) / len(cb))
+        return vs(a, b)
 
     gains = {t.trial_id: vs(t, reference) for t in done}
-    # the sets the selection chose from, so the report cannot drift from it
-    if cv:
-        cands, _, close = _one_se_sets(done, maximize, promote_se, top=top)
+    if cv and not confirmed:
+        # the sets the selection chose from, so the report cannot drift from it
+        cands, _, close = _one_se_sets(pool, maximize, promote_se, top=top)
         candidates = {reference.trial_id} | {t.trial_id for t in cands}
         near = {t.trial_id for t in close}
+    elif cv:
+        candidates = {reference.trial_id} | {
+            t.trial_id for t in done
+            if t is not reference and gains[t.trial_id][1] is not None
+            and (baseline is None
+                 or gains[t.trial_id][0] - promote_se * gains[t.trial_id][1] > 0)
+        }
+
+        def within(t):
+            """Within one SE of the top on the scores the selection used."""
+            if t is top:
+                return True
+            gap, se = vs_rule(top, t)[:2]
+            return se is not None and gap <= se
+
+        near = {t.trial_id for t in done if t.trial_id in candidates
+                and t.trial_id in confirmed and within(t)}
     else:
         candidates, near = {reference.trial_id}, {top.trial_id} & {reference.trial_id}
     ctx = {
         "metric": metric, "sign": sign, "reference": reference, "selected": selected,
         "top": top, "gains": gains, "candidates": candidates, "near": near,
         "space": space, "cv": cv, "promote_se": promote_se, "vs": vs,
+        "vs_rule": vs_rule, "chosen": chosen, "confirmed": bool(confirmed),
+        "rescored": set(confirmed or ()),
+        "pruned_from": (pruning or {}).get("selected")
+        if (pruning or {}).get("pruned_trial") == selected.trial_id else None,
         "one_se": one_se, "done": done, "baseline": baseline,
         "start": "start" if baseline else "first trial",
+        "bound": bound,
         "by_id": {t.trial_id: t for t in done},
     }
     flags = [{**f, "review": review.get(f["id"])}
-             for f in flags_for(card, explanation, test)]
+             for f in flags_for(card, explanation, test, fold_events=fold_events,
+                                min_events=min_events, signal=signal)]
     sections = [
         _summary(ctx, test, flags, notes),
         _task_section(task, dropped_models or {}, card),
         _model_section(ctx, rule, attribution, test),
     ]
+    if selected.features:
+        sections.append(_features_section(ctx, pruning, flags, test))
+    if confirmed:
+        sections.append(_confirm_section(ctx, confirmed, pruning))
     if explanation:
         sections.append(_decides_section(explanation))
     if test:
@@ -372,6 +447,8 @@ def build_report(
         "dropped_models": dropped_models or {},
         "card": card.to_dict() if card is not None else None,
         "explanation": explanation, "flags": flags,
+        "confirmed": {str(k): v for k, v in (confirmed or {}).items()},
+        "pruning": pruning, "signal": signal,
         "trials": [_public_trial(t) for t in trials],
     }
     return Report(title, sections, data)
@@ -382,6 +459,8 @@ def _summary(ctx, test, flags, notes) -> Section:
     sel, ref, metric = ctx["selected"], ctx["reference"], ctx["metric"]
     space = ctx["space"]
     blocks = [("p", f"**Note.** {n}") for n in notes]
+    blocks += [("p", f"**No signal?** {f['detail']} *(measured)*")
+               for f in flags if f["id"] == "no_signal"]
     blocks += [("p", (f"**Selected: #{sel.trial_id}, "
                      f"{_model_words(sel.config, space)}.** "
                      f"{_score_line(sel, ref, ctx)} *(measured)*"))]
@@ -392,6 +471,8 @@ def _summary(ctx, test, flags, notes) -> Section:
             line += f" against {_ci(test['baseline'])} for the starting pipeline"
             if "difference" in test:
                 line += f"; difference {_ci(test['difference'], signed=True)}"
+        if not has_intervals(test):
+            line += f" ({NO_INTERVALS})"
         blocks.append(("p", line + ". *(measured)*"))
         clinical = b.get("clinical")
         if clinical:
@@ -457,7 +538,9 @@ def _model_section(ctx, rule, attribution, test) -> Section:
                 + (" (top)" if t is top and t is not sel else ""),
                 t.config.model, space.rung(t.config), f"{t.score:.3f}",
                 ctx["start"] if t is ctx["reference"] else _pm(gain, se, better, n),
-                "yes" if t.trial_id in ctx["near"] else "no",
+                "yes" if t.trial_id in ctx["near"] else (
+                    "not re-scored" if ctx["confirmed"]
+                    and t.trial_id not in ctx["rescored"] else "no"),
             ])
         blocks.append(("p", (f"Candidates ({len(cands)} of {len(ctx['gains'])} "
                              "finished trials) *(measured)*:")))
@@ -526,6 +609,13 @@ def _trace_section(ctx, trials, lessons) -> Section:
                 parent, how = nearest.trial_id, " (inferred)"
                 diff = config_diff(nearest.config, t.config)
         change = ", ".join(f"{k} {v}" for k, v in diff.items()) or "-"
+        if t.added:
+            verdict = {True: "accepted", False: "not accepted"}.get(t.accepted, "")
+            change = (f"+ features {', '.join(t.added)} ({verdict})"
+                      + ("" if change == "-" else f"; {change}"))
+        elif t.agent in ("incumbent", "pruned"):
+            change = (f"{len(t.features)} accepted features" if t.agent == "incumbent"
+                      else f"pruned to {len(t.features)} features")
         if parent is not None:
             change = f"from #{parent}{how}: {change}"
         hyp = t.config.rationale or "-"
@@ -590,7 +680,8 @@ def _test_section(ctx, test) -> Section:
     names = {"best": "selected", "baseline": "starting pipeline",
              "top": "highest-scoring candidate"}
     present = [(k, n) for k, n in names.items() if k in test]
-    # PR-AUC's chance level is the prevalence, so only there is the ratio a lift.
+    # PR-AUC's chance level is about the prevalence, so only there is the
+    # ratio a lift.
     lift = metric == "pr_auc"
     rows = []
     for key, name in present:
@@ -605,14 +696,18 @@ def _test_section(ctx, test) -> Section:
     headers = ["config", "trial", "model", f"test {metric}"]
     if lift and any(test[k].get("clinical") for k, _ in present):
         headers.append("lift over prevalence")
-    blocks = [("p", ("Each config was retrained on all training patients and "
-                     "scored once on the test patients; intervals are "
-                     "patient-level bootstrap 95% CIs. *(measured)*")),
-              ("table", headers, rows)]
+    scored = ("Each config was retrained on all training patients and scored "
+              "once on the test patients; ")
+    scored += ("intervals are patient-level bootstrap 95% CIs." if has_intervals(test)
+               else f"{NO_INTERVALS}, so treat small differences as unconfirmed.")
+    blocks = [("p", scored + " *(measured)*"), ("table", headers, rows)]
     diffs = []
     if "difference" in test:
         diffs.append(f"selected − starting pipeline: "
                      f"{_ci(test['difference'], signed=True)}")
+    elif "best" in test and "baseline" in test:
+        gain = test["best"]["estimate"] - test["baseline"]["estimate"]
+        diffs.append(f"selected − starting pipeline: {gain:+.3f} (no interval)")
     if "top_minus_best" in test:
         diffs.append(f"highest-scoring − selected: "
                      f"{_ci(test['top_minus_best'], signed=True)}")
@@ -715,6 +810,87 @@ def _test_section(ctx, test) -> Section:
     return Section("Performance in clinical terms", blocks)
 
 
+def _features_section(ctx, pruning, flags, test) -> Section:
+    sel = ctx["selected"]
+    contribution = {}
+    for row in (pruning or {}).get("ablation", []):
+        for name in row["features"]:
+            contribution[name] = _pm(row["contribution"], row["se"])
+    open_flags = {f["id"].partition(":")[2] for f in flags
+                  if f["id"].partition(":")[0] in ("direction", "no_rationale",
+                                                   "suspicion")
+                  and (f.get("review") or {}).get("decision") != "approved"}
+    rows = []
+    for spec in sel.features:
+        name = spec["name"]
+        rows.append([name, spec.get("definition", "-"), spec.get("rationale", "-") or "-",
+                     _direction(spec.get("direction", "")),
+                     ", ".join(spec.get("citations") or []) or "-",
+                     contribution.get(name, "-"),
+                     "held for review" if name in open_flags else "in the model"])
+    blocks = [
+        ("p", (f"The selected model uses {len(sel.features)} engineered feature(s) "
+               "beyond the task's own inputs. Each definition is generated from the "
+               "feature's spec, so it states exactly what was computed; the "
+               "rationale and expected direction were given when it was proposed "
+               "*(hypothesis)*; the contribution is what its group added on the "
+               "confirmation folds *(tested)*.")),
+        ("table", ["feature", "definition", "rationale", "expected", "citations",
+                   "contribution", "status"], rows),
+    ]
+    held = (test or {}).get("held_back")
+    if held and "without_flagged" in (test or {}):
+        blocks.append(("p", (f"{', '.join(held)} await a clinician's approval. "
+                             "The headline test result uses them; for comparison, "
+                             "the selection without them scores test "
+                             f"{test.get('metric', ctx['metric'])} "
+                             f"{_ci(test['without_flagged'])}.")))
+    return Section("Features", blocks)
+
+
+def _confirm_section(ctx, confirmed, pruning) -> Section:
+    sign, ref = ctx["sign"], ctx["reference"]
+    by_id = {t.trial_id: t for t in ctx["done"]}
+    ref_scores = confirmed.get(ref.trial_id)
+    rows = []
+    for trial_id, scores in sorted(confirmed.items(),
+                                   key=lambda kv: -sign * sum(kv[1]) / len(kv[1])):
+        t = by_id.get(trial_id)
+        if t is None:
+            continue
+        mean = sum(scores) / len(scores)
+        gain = "start"
+        if t is not ref and ref_scores:
+            from .improver import paired_gain
+
+            g, se = paired_gain(scores, ref_scores, sign > 0)
+            gain = _pm(g, se)
+        rows.append([f"#{trial_id}" + (" (selected)" if t is ctx["selected"] else ""),
+                     t.config.model, len(t.features), f"{t.score:.3f}",
+                     f"{mean:.3f}", gain])
+    blocks = [
+        ("p", ("**Confirmation.** The leading candidates were scored again on new "
+               "folds with several training seeds, and the selection was made on "
+               "these scores. Candidates picked among many on the same folds are "
+               "partly lucky; this removes part of that luck before the test. "
+               "*(tested)*")),
+        ("table", ["trial", "model", "features", "search CV", "confirmed CV",
+                   "confirmed gain vs start"], rows),
+    ]
+    if pruning and pruning.get("ablation"):
+        blocks.append(("p", ("**What each feature group added** to the selection "
+                             "(removed one at a time, confirmation folds) "
+                             "*(tested)*:")))
+        blocks.append(("table", ["features", "added by", "contribution"], [
+            [", ".join(r["features"]), f"#{r['trial_id']}" if r["trial_id"] >= 0 else "-",
+             _pm(r["contribution"], r["se"])] for r in pruning["ablation"]]))
+        if pruning.get("dropped"):
+            blocks.append(("p", "**Pruned:** " + "; ".join(
+                ", ".join(g) for g in pruning["dropped"])
+                + " cost less than one SE to remove, so they were dropped."))
+    return Section("Confirmation", blocks)
+
+
 def _decides_section(explanation) -> Section:
     blocks = [("p", (f"How the selected model (#{explanation.get('trial_id')}) "
                      f"weighs its inputs, from {explanation['method']} on "
@@ -774,6 +950,9 @@ def _checklist_section(ctx, card, explanation, test, attribution) -> Section:
     clinical = (test or {}).get("best", {}).get("clinical")
     subgroups = bool(clinical and clinical.get("subgroups"))
     missing = "not covered"
+    # evaluate_on_test ran, but on a task without intervals or clinical metrics
+    not_binary = bool(test) and not has_intervals(test)
+    hint_test = "run evaluate_on_test"
 
     def where(ok, text, hint):
         return text if ok else f"{missing}: {hint}"
@@ -803,9 +982,12 @@ def _checklist_section(ctx, card, explanation, test, attribution) -> Section:
             ", with the attribution of each setting" if attribution else "")),
         ("Discrimination and calibration, with uncertainty", where(
             bool(clinical), "Performance in clinical terms",
-            "run evaluate_on_test")),
+            "intervals and calibration need a binary task"
+            if not_binary else hint_test)),
         ("Clinical utility", where(bool(clinical), "Performance in clinical terms: "
-                                   "alerts and net benefit", "run evaluate_on_test")),
+                                   "alerts and net benefit",
+                                   "alerts and net benefit need a binary task"
+                                   if not_binary else hint_test)),
         ("Fairness: performance in subgroups", where(
             subgroups, "Performance in clinical terms: subgroups",
             "pass subgroups to evaluate_on_test")),
@@ -823,18 +1005,48 @@ def _checklist_section(ctx, card, explanation, test, attribution) -> Section:
     ])
 
 
-def flags_for(card, explanation, test) -> list[dict[str, str]]:
+def flags_for(
+    card, explanation, test, suspicious=(), features=(), fold_events=None,
+    min_events=10, signal=None,
+) -> list[dict[str, str]]:
     """Items for clinician review, from the task card, explanation and test.
+
+    Engineered features are also flagged when they have no clinical
+    rationale (proposed by random search) or were ``suspicious``: alone they
+    predicted the outcome almost perfectly, which usually means leakage.
+    ``features`` are the selection's engineered specs; those without a
+    rationale are flagged whether or not ``explanation`` is given.
+    ``signal`` is the comparison with chance
+    (:func:`~pyhealth.autoimprove.improver.signal_check`); a run whose
+    baseline or selection does not beat chance gets a ``no_signal`` flag.
 
     Examples:
         >>> [f["id"] for f in flags_for(None, None, None)]
         ['no_task_card']
+        >>> spec = {"name": "count_90d__visits", "rationale": "none: random"}
+        >>> [f["id"] for f in flags_for(None, None, None, features=[spec])]
+        ['no_task_card', 'no_rationale:count_90d__visits']
+        >>> [f["id"] for f in flags_for(None, None, None, fold_events=[7, 6, 7])]
+        ['no_task_card', 'few_events']
+        >>> weak = {"no_signal": True, "detail": "The baseline is not above chance."}
+        >>> [f["id"] for f in flags_for(None, None, None, signal=weak)]
+        ['no_signal', 'no_task_card']
     """
     out = []
+    if signal and signal.get("no_signal"):
+        out.append({"id": "no_signal", "kind": "signal", "detail": signal["detail"]})
     if card is None:
         out.append({"id": "no_task_card", "kind": "task",
                     "detail": "No task card: the cohort, outcome and features have "
                               "no recorded clinical rationale."})
+    if fold_events and min(fold_events) < min_events:
+        out.append({"id": "few_events", "kind": "data",
+                    "detail": f"The cross-validation folds have "
+                              f"{', '.join(map(str, fold_events))} positive "
+                              f"samples (fewer than {min_events} per fold), so one "
+                              "lucky fold can carry a trial's whole gain. Fewer "
+                              "folds do not fix this; treat the search's gains as "
+                              "unconfirmed and confirm them on more events."})
     for f in (explanation or {}).get("features", []):
         if f["check"] == "opposite":
             out.append({
@@ -846,10 +1058,31 @@ def flags_for(card, explanation, test) -> list[dict[str, str]]:
                            "value of one measure), a coding artifact, a data error "
                            "or leakage."),
             })
+        elif f.get("engineered") and str(f.get("rationale", "")).startswith("none"):
+            out.append({"id": f"no_rationale:{f['name']}", "kind": "rationale",
+                        "detail": f"{f['name']} was proposed without a clinical "
+                                  "rationale (random search); keep it only if a "
+                                  "clinician can justify it."})
         elif card is not None and not f["in_card"]:
             out.append({"id": f"no_rationale:{f['name']}", "kind": "rationale",
                         "detail": f"{f['name']} is a top feature with no entry in "
                                   "the task card's dictionary."})
+    # The selection's engineered features without a rationale are flagged
+    # even when explain() has not run, so the review gate holds them back.
+    seen = {f["id"] for f in out}
+    for spec in features:
+        flag_id = f"no_rationale:{spec['name']}"
+        if (str(spec.get("rationale", "")).startswith("none")
+                and flag_id not in seen):
+            seen.add(flag_id)
+            out.append({"id": flag_id, "kind": "rationale",
+                        "detail": f"{spec['name']} was proposed without a clinical "
+                                  "rationale (random search); keep it only if a "
+                                  "clinician can justify it."})
+    for name in suspicious:
+        out.append({"id": f"suspicion:{name}", "kind": "leakage",
+                    "detail": f"{name} alone predicts the outcome almost perfectly: "
+                              "check that it cannot see the outcome."})
     clinical = (test or {}).get("best", {}).get("clinical")
     if clinical:
         cal = clinical["calibration"]
@@ -911,7 +1144,33 @@ def _why(ctx) -> str:
         return (f"{lead} It is the most interpretable trial ({words}) whose score "
                 f"is within one standard error of the best, #{top.trial_id}: "
                 f"{_pm(gap, se, better, k)}. *(measured)*")
-    if sel is ref and len(ctx["candidates"]) == 1:
+    if sel is ref:
+        passed = len(ctx["candidates"]) - 1
+        if ctx["confirmed"] and passed:
+            def kept_gain(t) -> bool:
+                gain, se = ctx["vs_rule"](t, ref)[:2]
+                return se is not None and gain - ctx["bound"] * se > 0
+
+            kept = [t for t in ctx["done"] if t is not ref
+                    and t.trial_id in ctx["candidates"]
+                    and t.trial_id in ctx["rescored"] and kept_gain(t)]
+            if kept and ctx["one_se"]:
+                return (f"{len(kept)} trial(s) kept a gain of {ctx['bound']:g} "
+                        "standard errors on the confirmation folds, but the starting "
+                        "pipeline is simpler and scores within one standard error of "
+                        f"the best, #{top.trial_id}, so the one-SE rule keeps it "
+                        "(see *Confirmation*). *(measured)*")
+            if not kept:
+                return (f"{passed} trial(s) beat the starting pipeline on the search "
+                        f"folds, but none kept a gain of {ctx['bound']:g} standard "
+                        "errors on the confirmation folds (see *Confirmation*), so "
+                        "it stays selected. *(measured)*")
+        if passed:
+            rule = ("it is simpler and scores within one standard error of the "
+                    "best of them" if ctx["one_se"] else
+                    "the selection rule kept it")
+            return (f"{passed} trial(s) cleared the search bound over the starting "
+                    f"pipeline, but it stays selected: {rule}. *(measured)*")
         return ("No trial beat the starting pipeline consistently across folds, so "
                 "it stays selected. *(measured)*")
     if not ctx["one_se"]:
@@ -924,12 +1183,35 @@ def _why(ctx) -> str:
         return (f"It beat the starting pipeline consistently across folds and has "
                 f"the highest score of the {n} candidates ({words}).{tail} "
                 "*(measured)*")
-    gap, se, better, n = ctx["vs"](top, sel)
-    return (f"It is the most interpretable candidate ({words}) whose score is within "
-            f"one standard error of the highest-scoring candidate, #{top.trial_id} "
-            f"({top.config.model}, rung {space.rung(top.config)}). Choosing it costs "
-            f"{_pm(gap, se, better, n)} in CV score, which is within noise. "
-            "*(measured)*")
+    chosen = ctx["chosen"]
+    on = " on the confirmation folds" if ctx["confirmed"] else ""
+    if chosen is top:
+        text = f"It had the highest score{on} ({words})."
+    else:
+        gap, se, better, k = ctx["vs_rule"](top, chosen)
+        name = "It" if chosen is sel else f"#{chosen.trial_id}"
+        text = (f"{name} scored within one standard error of the highest-scoring "
+                f"candidate, #{top.trial_id} ({top.config.model}, rung "
+                f"{space.rung(top.config)}){on}, and {_simpler(chosen, top, space)}. "
+                f"Choosing it costs {_pm(gap, se, better, k)}, which is within noise.")
+    if chosen is not sel:
+        text += (f" Pruning then removed features it did not need, leaving "
+                 f"#{sel.trial_id} with {len(sel.features)} engineered feature(s) "
+                 "(see *Confirmation*).")
+    elif ctx["pruned_from"] is not None:
+        text += (f" It is #{ctx['pruned_from']} after pruning removed the features "
+                 "it did not need (see *Confirmation*).")
+    return text + " *(measured)*"
+
+
+def _simpler(a, b, space) -> str:
+    """Why the one-SE rule preferred ``a`` to ``b``, as a verb phrase."""
+    ra, rb = space.rung(a.config), space.rung(b.config)
+    if ra != rb:
+        return f"is simpler (rung {ra} vs {rb})"
+    if len(a.features) != len(b.features):
+        return f"uses fewer engineered features ({len(a.features)} vs {len(b.features)})"
+    return "scores higher on the same rung"
 
 
 def _brief_error(t) -> str:
@@ -973,13 +1255,18 @@ def _verdict(t, ctx) -> str:
         return "starting pipeline; trials that beat it consistently replace it"
     gain, se, _, _ = ctx["gains"][t.trial_id]
     space = ctx["space"]
+    chosen = ctx["chosen"]
+    if t is chosen:
+        return f"chosen by the selection rule, then pruned to #{sel.trial_id}"
+    if t.trial_id == ctx["pruned_from"]:
+        return f"pruned to #{sel.trial_id}, the selection"
     if t.trial_id in ctx["candidates"]:
         if t is top:
-            return (f"highest score, but #{sel.trial_id} is within one SE and "
-                    f"simpler (rung {space.rung(sel.config)} vs {space.rung(t.config)})")
+            return (f"highest score, but #{chosen.trial_id} is within one SE and "
+                    f"{_simpler(chosen, t, space)}")
         if t.trial_id in ctx["near"]:
-            return (f"within one SE of the top, but #{sel.trial_id} is simpler or "
-                    "scores higher on the same rung")
+            return (f"within one SE of the top, but #{chosen.trial_id} is simpler, "
+                    "uses fewer features or scores higher on the same rung")
         return (("beat the start, but " if ctx["baseline"] else "")
                 + f"more than one SE below the top candidate #{top.trial_id}")
     if se is None or gain <= 0:
@@ -1080,6 +1367,26 @@ def _pm(gain, se, better=None, n=None) -> str:
 
 def _signed(value) -> str:
     return f"{value:+.3f}"
+
+
+NO_INTERVALS = ("point estimates without confidence intervals: bootstrap intervals "
+                "are computed for binary tasks only")
+
+
+def has_intervals(test: dict[str, Any] | None) -> bool:
+    """Whether an ``evaluate_on_test`` result holds confidence intervals.
+
+    Binary tasks get patient-level bootstrap intervals; other label types
+    get the metric's value only, and the report must not promise more.
+
+    Examples:
+        >>> has_intervals({"best": {"estimate": 0.3, "lower": 0.2, "upper": 0.4}})
+        True
+        >>> has_intervals({"metric": "f1_macro", "best": {"estimate": 0.15}})
+        False
+    """
+    return any(isinstance(r, dict) and r.get("lower") is not None
+               for r in (test or {}).values())
 
 
 def _ci(r: dict[str, Any], signed: bool = False) -> str:

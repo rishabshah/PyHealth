@@ -47,14 +47,15 @@ from .deep_nested_sequence_processor import (
 )
 from .raw_processor import RawProcessor
 from .sequence_processor import SequenceProcessor
-from .sequence_processor_v2 import (
+from .jagged_processor import (
     Impute,
+    JaggedFeatureProcessor,
     LevelConfig,
     Normalize,
     Records,
     Resample,
-    SequenceProcessorV2,
 )
+from .sequence_processor_v2 import SequenceProcessorV2
 from .signal_processor import SignalProcessor
 from .stagenet_processor import (
     StageNetProcessor,
@@ -71,6 +72,7 @@ from .timeseries_label_processor import (
     TimeseriesRegressionLabelProcessor,
 )
 from .time_image_processor import TimeImageProcessor
+from .time_region_image_processor import TimeRegionImageProcessor
 from .graph_processor import GraphProcessor
 from .ancestor_rollup_processor import (
     AncestorRollupProcessor,
@@ -82,15 +84,25 @@ from .ignore_processor import IgnoreProcessor
 from .temporal_timeseries_processor import TemporalTimeseriesProcessor
 from .tuple_time_text_processor import TupleTimeTextProcessor
 from .cehr_processor import CehrProcessor, ConceptVocab
+from .ethos_processor import EthosProcessor
+from .ethos_context_processor import EthosContextProcessor
+from .unified_bridge import (
+    BridgeDataset,
+    UnifiedBridge,
+    transform_batch,
+    transform_processor,
+)
 
 # Expose public API
 from .base_processor import (
     FeatureProcessor,
+    LegacyFeatureProcessor,
     ModalityType,
     TemporalFeatureProcessor,
 )
 __all__ = [
     "FeatureProcessor",
+    "LegacyFeatureProcessor",
     "ModalityType",
     "TemporalFeatureProcessor",
     "ImageProcessor",
@@ -104,11 +116,18 @@ __all__ = [
     "SegmentationBinaryLabelProcessor",
     "SegmentationMultiClassLabelProcessor",
     "NestedFloatsProcessor",
+    "DeepNestedFloatsProcessor",
+    "DeepNestedSequenceProcessor",
     "NestedMultiHotProcessor",
     "NestedSequenceProcessor",
     "RawProcessor",
     "SequenceProcessor",
     "SequenceProcessorV2",
+    "JaggedFeatureProcessor",
+    "UnifiedBridge",
+    "BridgeDataset",
+    "transform_batch",
+    "transform_processor",
     "Records",
     "LevelConfig",
     "Impute",
@@ -127,12 +146,16 @@ __all__ = [
     "TimeseriesProcessor",
     "TimeseriesRegressionLabelProcessor",
     "TimeImageProcessor",
+    "TimeRegionImageProcessor",
     "GraphProcessor",
     "AncestorRollupProcessor",
     "RollupResult",
     "UnmappedCodeError",
     "AudioProcessor",
+    "IgnoreProcessor",
     "TupleTimeTextProcessor",
     "CehrProcessor",
     "ConceptVocab",
+    "EthosProcessor",
+    "EthosContextProcessor",
 ]
