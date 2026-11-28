@@ -81,6 +81,31 @@ class OMOPConditionHierarchy:
         depth_measure: ``"min"`` or ``"max"``.
         connect_orphans: Whether orphans were attached to their nearest kept
             ancestor.
+
+    Example:
+        Construct a small synthetic hierarchy without external vocabulary files:
+
+        >>> import polars as pl
+        >>> nodes = pl.DataFrame({
+        ...     "concept_id": [1, 2],
+        ...     "concept_name": ["Root", "Child"],
+        ...     "concept_code": ["SYN1", "SYN2"],
+        ...     "min_depth": [0, 1], "max_depth": [0, 1], "depth": [0, 1],
+        ... })
+        >>> edges = pl.DataFrame({
+        ...     "parent_id": [1], "child_id": [2], "rescued": [False],
+        ... })
+        >>> ancestors = pl.DataFrame({
+        ...     "concept_id": [2], "ancestor_id": [1], "distance": [1],
+        ... })
+        >>> hierarchy = OMOPConditionHierarchy(
+        ...     nodes, edges, ancestors, root_concept_id=1, max_depth=1,
+        ...     depth_measure="min", connect_orphans=False,
+        ... )
+        >>> hierarchy.parents(2)
+        [1]
+        >>> hierarchy.depth(2)
+        1
     """
 
     def __init__(
