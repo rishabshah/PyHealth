@@ -19,7 +19,7 @@ import torch
 
 from pyhealth.graph import KnowledgeGraph
 from pyhealth.graph.cooccurrence import build_cooccurrence
-from pyhealth.medcode import OMOPVocabulary
+from pyhealth.medcode import DISEASE_CONCEPT_ID, OMOPVocabulary
 from pyhealth.medcode.omop import ICDToSNOMEDMapper
 from pyhealth.processors import AncestorRollupProcessor
 
@@ -44,16 +44,14 @@ def build_keep_omop_ancestor_rollup(
 ) -> AncestorRollupProcessor:
     """Build an ancestor roll-up processor over KEEP's OMOP Disease hierarchy.
 
-    The vocabulary supplies concept metadata and relationships. The uncut
-    SNOMED condition subtree (``condition_hierarchy(max_depth=None,
-    depth_measure="min")``, rooted at Disease, concept 4274025) supplies
-    the traversal edges and the closure-derived root depths, which are
-    authoritative following KEEP appendix A.1.1. The processor's
-    ``max_depth`` then governs *target eligibility* over that uncut
-    subtree, so deep sources and intermediates stay traversable — the
-    same number as the hierarchy's build-time cutoff, but a different
-    layer. For the embedding stage, choose the training vocabulary
-    explicitly and supply trained vectors by concept code for projection.
+    The factory shares the vocabulary reader's queries for the uncut SNOMED
+    Condition subtree rooted at Disease (concept 4274025) and its direct
+    "Is a" edges. Minimum separations from Disease in ``CONCEPT_ANCESTOR``
+    supply the authoritative root depths, following KEEP appendix A.1.1.
+    The processor's ``max_depth`` governs *target eligibility* over the
+    uncut subtree, so deep sources and intermediates stay traversable.
+    For the embedding stage, choose the training vocabulary explicitly
+    and supply trained vectors by concept code for projection.
 
     The classification universe is every valid standard SNOMED concept
     with its domain, so ``unknown_code`` (not a valid standard SNOMED
@@ -63,12 +61,11 @@ def build_keep_omop_ancestor_rollup(
     processor boundary. Decode projected ``node_ids`` through the graph's
     ``id2entity`` lookup.
 
-    Orphan-rescue shortcuts (the reader's ``connect_orphans`` edges) are
-    *not* used: the baseline builds paths from the direct ``Is a`` rows
-    plus, under ``path_source="closure"``, the separation-one
-    ``CONCEPT_ANCESTOR`` pairs. Whether processor traversal should also
-    follow rescue shortcuts is deferred; the reader's hierarchy export
-    keeps them available for other consumers.
+    Direct mode builds paths from the direct ``Is a`` rows. Closure mode
+    also loads separation-one ``CONCEPT_ANCESTOR`` pairs within the subtree.
+    The public hierarchy export offers orphan-rescue shortcuts through
+    ``connect_orphans``. Adding those shortcuts to KEEP traversal remains
+    a separate policy decision.
 
     Args:
         vocabulary: an :class:`~pyhealth.medcode.OMOPVocabulary` pointed
@@ -117,9 +114,9 @@ def build_keep_omop_ancestor_rollup(
     # eligibility over it, so no build-time truncation here. KEEP's
     # depth measure ("min") is pinned; "max" stays the reader's option.
     # No orphan rescue: the deferral is documented above.
-    hierarchy = vocabulary.condition_hierarchy(
-        max_depth=None, depth_measure="min", connect_orphans=False
-    )
+    root_concept_id = DISEASE_CONCEPT_ID
+    nodes = vocabulary._rooted_condition_nodes(root_concept_id)
+    edges = vocabulary._direct_is_a_edges(nodes)
     # Classification universe: every valid standard SNOMED concept, all
     # domains (mirrors the reader's own validity/standard filters).
     universe = (
@@ -139,7 +136,7 @@ def build_keep_omop_ancestor_rollup(
         str(concept_id): domain_id
         for concept_id, domain_id in universe.iter_rows()
     }
-    root = str(hierarchy.root_concept_id)
+    root = str(root_concept_id)
     if root not in domain_by_code:
         raise ValueError(
             f"the hierarchy root {root!r} is not a valid standard SNOMED "
@@ -147,26 +144,36 @@ def build_keep_omop_ancestor_rollup(
         )
     direct_edges = [
         (str(parent), str(child))
-        for parent, child in hierarchy.edges.select(
+        for parent, child in edges.select(
             "parent_id", "child_id"
         ).iter_rows()
     ]
     closure_pairs = None
     if path_source == "closure":
-        separation_one = hierarchy.ancestors.filter(
-            pl.col("distance") == 1
+        node_ids = nodes.select("concept_id").lazy()
+        separation_one = (
+            vocabulary.scan("CONCEPT_ANCESTOR")
+            .filter(pl.col("min_levels_of_separation") == 1)
+            .select(
+                pl.col("descendant_concept_id").alias("concept_id"),
+                pl.col("ancestor_concept_id").alias("ancestor_id"),
+            )
+            .join(node_ids, on="concept_id", how="semi")
+            .join(
+                node_ids,
+                left_on="ancestor_id",
+                right_on="concept_id",
+                how="semi",
+            )
+            .collect(engine="streaming")
         )
         closure_pairs = [
             (str(ancestor), str(descendant))
-            for descendant, ancestor in separation_one.select(
-                "concept_id", "ancestor_id"
-            ).iter_rows()
+            for descendant, ancestor in separation_one.iter_rows()
         ]
     root_depths = {
         str(concept_id): int(depth)
-        for concept_id, depth in hierarchy.nodes.select(
-            "concept_id", "depth"
-        ).iter_rows()
+        for concept_id, depth in nodes.select("concept_id", "min_depth").iter_rows()
     }
     # Explicit IDs retain concepts whose incoming edges were filtered out.
     entity2id = {code: index for index, code in enumerate(sorted(root_depths))}
@@ -220,8 +227,8 @@ def build_keep_omop_ancestor_rollup(
         loader_provenance={
             "hierarchy_relation": relation,
             "vocabulary_source": "pyhealth.medcode.OMOPVocabulary",
-            "hierarchy_root": str(hierarchy.root_concept_id),
-            "depth_measure": hierarchy.depth_measure,
+            "hierarchy_root": root,
+            "depth_measure": "min",
             "hierarchy_max_depth": "None (uncut subtree)",
             "rescued_edges": "0 (orphan rescue deferred)",
         },
