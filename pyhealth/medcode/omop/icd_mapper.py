@@ -67,6 +67,23 @@ class ICDToSNOMEDMapper:
             ``source_concept_id``, ``concept_id`` (null when the code has no
             valid "Maps to" link), ``concept_name``, ``target_domain_id`` and
             ``target_vocabulary_id``.
+
+    Example:
+        Build a minimal synthetic lookup without downloading a vocabulary:
+
+        >>> import polars as pl
+        >>> table = pl.DataFrame({
+        ...     "icd_version": [10, 10, 10],
+        ...     "icd_code": ["SYN1", "SYN1", "SYN2"],
+        ...     "concept_id": [101, 102, None],
+        ... })
+        >>> mapper = ICDToSNOMEDMapper(table)
+        >>> mapper.map(" syn.1 ", version=10)
+        [101, 102]
+        >>> mapper.map("SYN2", version=10)
+        []
+        >>> (10, "SYN2") in mapper
+        True
     """
 
     def __init__(self, table: pl.DataFrame):
